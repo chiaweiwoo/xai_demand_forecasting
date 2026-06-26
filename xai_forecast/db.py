@@ -53,6 +53,24 @@ def get_all_weeks(conn: sqlite3.Connection) -> list[str]:
     return [r[0] for r in cur.fetchall()]
 
 
+# ── Feature store reads (used by backtest after build_features.py) ────────────
+
+def load_features_window(conn: sqlite3.Connection, week_start: str, week_end: str) -> pd.DataFrame:
+    """Training window: all precomputed feature rows for (week_start, week_end]."""
+    return pd.read_sql(
+        'SELECT * FROM features WHERE week > ? AND week <= ? ORDER BY unique_id, week',
+        conn, params=(week_start, week_end),
+    )
+
+
+def load_features_week(conn: sqlite3.Connection, week: str) -> pd.DataFrame:
+    """Single forecast week: one precomputed feature row per SKU."""
+    return pd.read_sql(
+        'SELECT * FROM features WHERE week = ?',
+        conn, params=(week,),
+    )
+
+
 # ── Ingest writes ─────────────────────────────────────────────────────────────
 
 def insert_raw(conn: sqlite3.Connection, weekly_sales: pd.DataFrame,

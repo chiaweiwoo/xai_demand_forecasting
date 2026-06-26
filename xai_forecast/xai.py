@@ -118,8 +118,10 @@ def contrastive_payloads(
 ) -> list[dict]:
     """
     For each bad item find a good reference week (same week-of-year, MAPE < 15%)
-    and diff the SHAP profiles. Fetches reference feature rows from SQLite.
+    and diff the SHAP profiles. Fetches reference feature rows from the feature store.
     """
+    from xai_forecast.db import load_features_week
+
     bad_woy = pd.Timestamp(forecast_week).isocalendar()[1]
     results = []
 
@@ -131,32 +133,14 @@ def contrastive_payloads(
             continue
 
         same_woy = good_weeks[
-            good_weeks['cutoff_week'].apply(
-                lambda w: pd.Timestamp(w + ' 00:00:00' if isinstance(w, str) else w).isocalendar()[1] == bad_woy
-                if isinstance(w, str) else w.isocalendar()[1] == bad_woy
+            good_weeks['forecast_week'].apply(
+                lambda w: pd.Timestamp(w).isocalendar()[1] == bad_woy
             )
         ]
         ref_row = same_woy.iloc[-1] if not same_woy.empty else good_weeks.iloc[-1]
+        ref_forecast_week = ref_row['forecast_week']
 
-        # cutoff_week is the training cutoff; the forecast week is one week later
-        ref_cutoff = ref_row['cutoff_week']
-        if isinstance(ref_cutoff, str):
-            ref_forecast_week = (pd.Timestamp(ref_cutoff) + pd.Timedelta(weeks=1)).strftime('%Y-%m-%d')
-        else:
-            ref_forecast_week = (ref_cutoff + pd.Timedelta(weeks=1)).strftime('%Y-%m-%d')
-
-        from xai_forecast.db import load_raw_window
-        from xai_forecast.features import compute_features, HISTORY_BUFFER
-        all_weeks = sorted(pd.read_sql(
-            "SELECT DISTINCT week FROM weekly_sales ORDER BY week", conn
-        )['week'].tolist())
-        ref_step = all_weeks.index(ref_forecast_week) if ref_forecast_week in all_weeks else -1
-        if ref_step < 0:
-            continue
-        buf = all_weeks[max(0, ref_step - HISTORY_BUFFER)]
-        ref_raw = load_raw_window(conn, buf, ref_forecast_week)
-        ref_full = compute_features(ref_raw)
-        ref_df   = ref_full[ref_full['week'] == ref_forecast_week]
+        ref_df   = load_features_week(conn, ref_forecast_week)
         ref_item = ref_df[ref_df['unique_id'] == uid]
         bad_item = week_df[week_df['unique_id'] == uid]
 
@@ -167,7 +151,7 @@ def contrastive_payloads(
             [bad_item[FEATURE_COLS].fillna(0), ref_item[FEATURE_COLS].fillna(0)],
             ignore_index=True,
         )
-        sv = explainer.shap_values(X_both.values)
+        sv = explainer.shap_values(X_both)
 
         diffs = sorted(
             [

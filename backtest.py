@@ -4,8 +4,8 @@ Full backtesting simulation. Run ingest.py first.
 Usage:
     uv run python backtest.py
 
-At each iteration: query raw tables -> compute features in memory -> train -> forecast.
-No features table -- feature engineering is part of the pipeline, not precomputed.
+At each iteration: load precomputed features from the feature store -> train -> forecast.
+Requires build_features.py to have run first.
 
 Week key convention: all tables (forecasts, evaluations, xai_results) are keyed on
 forecast_week -- the week the failure was observed, not the training cutoff. This is
@@ -23,10 +23,11 @@ from tqdm import tqdm
 import pandas as pd
 
 from xai_forecast.db import (
-    get_conn, get_all_weeks, load_raw_window,
+    get_conn, get_all_weeks,
+    load_features_window, load_features_week,
     insert_forecasts, insert_evaluations, insert_xai,
 )
-from xai_forecast.features import compute_features, FEATURE_COLS, HISTORY_BUFFER
+from xai_forecast.features import FEATURE_COLS
 from xai_forecast.train import train_model
 from xai_forecast.forecast import make_forecasts
 from xai_forecast.evaluate import evaluate_h1, flag_bad_weeks
@@ -43,7 +44,13 @@ def main() -> None:
     weeks = get_all_weeks(conn)
 
     if not weeks:
-        print('No data. Run: uv run python ingest.py')
+        print('No data. Run: uv run python ingest.py && uv run python build_features.py')
+        return
+
+    n_features = conn.execute('SELECT COUNT(*) FROM features').fetchone()[0]
+    if n_features == 0:
+        print('Feature store empty. Run: uv run python build_features.py')
+        conn.close()
         return
 
     print(f'{len(weeks)} weeks ({weeks[0]} -> {weeks[-1]})')
@@ -59,16 +66,10 @@ def main() -> None:
 
         if i % RETRAIN_FREQ == 0:
             window_start = weeks[step - TRAIN_WINDOW]
-            buffer_start = weeks[max(0, step - TRAIN_WINDOW - HISTORY_BUFFER)]
-            raw_df       = load_raw_window(conn, buffer_start, cutoff)
-            features_df  = compute_features(raw_df)
-            train_df     = features_df[features_df['week'] > window_start].dropna(subset=FEATURE_COLS)
+            train_df     = load_features_window(conn, window_start, cutoff).dropna(subset=FEATURE_COLS)
             model        = train_model(train_df)
 
-        buf_start = weeks[max(0, step + 1 - HISTORY_BUFFER)]
-        raw_fcst  = load_raw_window(conn, buf_start, forecast_week)
-        feat_fcst = compute_features(raw_fcst)
-        week_df   = feat_fcst[feat_fcst['week'] == forecast_week]
+        week_df = load_features_week(conn, forecast_week)
         preds     = make_forecasts(model, week_df, forecast_week)
 
         # Store under forecast_week -- the week the failure was observed
@@ -102,20 +103,13 @@ def main() -> None:
 
     print('\nComputing XAI...')
     # Single model on most recent 3-year window (see module docstring for caveat)
-    buf_start = weeks[max(0, len(weeks) - TRAIN_WINDOW - HISTORY_BUFFER - 1)]
-    raw_df    = load_raw_window(conn, buf_start, weeks[-1])
-    feat_df   = compute_features(raw_df)
-    train_df  = feat_df[feat_df['week'] > weeks[-TRAIN_WINDOW - 1]].dropna(subset=FEATURE_COLS)
-    model     = train_model(train_df)
-    explainer = make_explainer(model)
+    window_start = weeks[-TRAIN_WINDOW - 1]
+    train_df     = load_features_window(conn, window_start, weeks[-1]).dropna(subset=FEATURE_COLS)
+    model        = train_model(train_df)
+    explainer    = make_explainer(model)
 
-    # bad_weeks contains forecast_weeks — iterate directly
     for forecast_week in tqdm(bad_weeks, desc='XAI'):
-        step      = weeks.index(forecast_week)
-        buf_start = weeks[max(0, step - HISTORY_BUFFER)]
-        raw_fcst  = load_raw_window(conn, buf_start, forecast_week)
-        feat_fcst = compute_features(raw_fcst)
-        week_df   = feat_fcst[feat_fcst['week'] == forecast_week]
+        week_df = load_features_week(conn, forecast_week)
 
         week_evals = all_evals_df[all_evals_df['forecast_week'] == forecast_week]
         top_items  = week_evals.nlargest(TOP_N_XAI, 'mape')['unique_id'].tolist()

@@ -13,10 +13,10 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from xai_forecast.db import (
-    get_conn, get_all_weeks, load_raw_window,
+    get_conn, get_all_weeks, load_features_window, load_features_week,
     insert_forecasts, insert_evaluations, insert_xai, week_summary,
 )
-from xai_forecast.features import compute_features, FEATURE_COLS, HISTORY_BUFFER
+from xai_forecast.features import FEATURE_COLS
 from xai_forecast.train import train_model
 from xai_forecast.forecast import make_forecasts
 from xai_forecast.evaluate import evaluate_h1
@@ -45,20 +45,14 @@ def fail(msg: str) -> None:
 
 def run_week(forecast_week: str, weeks: list, model, explainer) -> dict:
     t0 = time.perf_counter()
-    step = weeks.index(forecast_week)
 
     # Each thread gets its own SQLite connection (WAL mode allows concurrent reads)
-    conn = get_conn(DB_PATH)
-    buf_start = weeks[max(0, step - HISTORY_BUFFER)]
-    raw       = load_raw_window(conn, buf_start, forecast_week)
+    conn    = get_conn(DB_PATH)
+    week_df = load_features_week(conn, forecast_week)
     conn.close()
 
-    t_sql = time.perf_counter() - t0
-
-    feat    = compute_features(raw)
-    week_df = feat[feat['week'] == forecast_week]
-
-    t_feat = time.perf_counter() - t0 - t_sql
+    t_sql  = time.perf_counter() - t0
+    t_feat = 0.0  # precomputed — no feature engineering at runtime
 
     preds   = make_forecasts(model, week_df, forecast_week)
     eval_df = evaluate_h1(preds, week_df[['unique_id', 'y']])
@@ -107,17 +101,20 @@ def main() -> None:
     print(f'\n[STEP] Setup  ({time.perf_counter()-t:.2f}s)')
     print(f'  {len(weeks)} weeks in DB ({weeks[0]} -> {weeks[-1]})')
 
+    # ── Check feature store ────────────────────────────────────────
+    conn = get_conn(DB_PATH)
+    n_feat = conn.execute('SELECT COUNT(*) FROM features').fetchone()[0]
+    conn.close()
+    if n_feat == 0:
+        fail('Feature store empty -- run: uv run python build_features.py')
+
     # ── Train (single model, weeks[TRAIN_WINDOW] cutoff) ──────────
     t = time.perf_counter()
-    conn  = get_conn(DB_PATH)
+    conn         = get_conn(DB_PATH)
     cutoff       = weeks[TRAIN_WINDOW]
     window_start = weeks[0]
-    buffer_start = weeks[0]   # max(0, 156-156-52) = 0
-    raw_df       = load_raw_window(conn, buffer_start, cutoff)
+    train_df     = load_features_window(conn, window_start, cutoff).dropna(subset=FEATURE_COLS)
     conn.close()
-
-    features_df = compute_features(raw_df)
-    train_df    = features_df[features_df['week'] > window_start].dropna(subset=FEATURE_COLS)
 
     if len(train_df) == 0:
         fail('Empty training set')
