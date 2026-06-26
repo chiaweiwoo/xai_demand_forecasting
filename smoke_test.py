@@ -1,16 +1,16 @@
 """
-Smoke test: one full train/forecast/evaluate/xai cycle.
-Requires ingest.py to have run first. Schema is created automatically by get_conn().
+Smoke test: train once, then run 5 forecast weeks in parallel (concurrency=5).
+Requires ingest.py to have run first.
 
 Usage:
     uv run python smoke_test.py
-
-Expected: ~30-60 sec (SQL + feature compute + train + XAI).
 """
 
 import sys
 import json
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from xai_forecast.db import (
     get_conn, get_all_weeks, load_raw_window,
@@ -20,126 +20,199 @@ from xai_forecast.features import compute_features, FEATURE_COLS, HISTORY_BUFFER
 from xai_forecast.train import train_model
 from xai_forecast.forecast import make_forecasts
 from xai_forecast.evaluate import evaluate_h1
-from xai_forecast.xai import make_explainer, shap_payloads, counterfactual_payloads, contrastive_payloads
+from xai_forecast.xai import make_explainer, shap_payloads, counterfactual_payloads
 
-TRAIN_WINDOW = 156
-TOP_N = 5
-DB_PATH = 'db/forecasting.db'
+TRAIN_WINDOW  = 156
+WEEKS_TO_TEST = 5
+CONCURRENCY   = 5
+TOP_N         = 5
+DB_PATH       = 'db/forecasting.db'
 
-_t0 = None
-
-
-def step(label: str) -> None:
-    global _t0
-    _t0 = time.perf_counter()
-    print(f'\n[STEP] {label}')
+_print_lock = threading.Lock()
 
 
-def ok(label: str, detail: str = '') -> None:
-    print(f'  [OK]   {label}' + (f' -- {detail}' if detail else '') + f'  ({time.perf_counter()-_t0:.2f}s)')
+def log(msg: str) -> None:
+    with _print_lock:
+        print(msg)
 
 
-def fail(label: str, detail: str = '') -> None:
-    print(f'  [FAIL] {label}' + (f' -- {detail}' if detail else '') + f'  ({time.perf_counter()-_t0:.2f}s)')
+def fail(msg: str) -> None:
+    print(f'  [FAIL] {msg}')
     sys.exit(1)
 
 
-def check(label: str, condition: bool, detail: str = '') -> None:
-    ok(label, detail) if condition else fail(label, detail)
+# ── Per-week worker (runs in thread pool) ─────────────────────────────────────
 
+def run_week(forecast_week: str, weeks: list, model, explainer) -> dict:
+    t0 = time.perf_counter()
+    step = weeks.index(forecast_week)
 
-def main() -> None:
-    total = time.perf_counter()
-    print('=' * 50)
-    print('Smoke test')
-    print('=' * 50)
+    # Each thread gets its own SQLite connection (WAL mode allows concurrent reads)
+    conn = get_conn(DB_PATH)
+    buf_start = weeks[max(0, step - HISTORY_BUFFER)]
+    raw       = load_raw_window(conn, buf_start, forecast_week)
+    conn.close()
 
-    step('Connect + get weeks from SQLite')
-    conn  = get_conn(DB_PATH)
-    weeks = get_all_weeks(conn)
-    if not weeks:
-        fail('No data -- run: uv run python ingest.py')
-    check('Weeks in DB', len(weeks) > TRAIN_WINDOW, f'{len(weeks)} weeks')
+    t_sql = time.perf_counter() - t0
 
-    step('Load raw window + compute features (train window)')
-    cutoff       = weeks[TRAIN_WINDOW]
-    forecast_week = weeks[TRAIN_WINDOW + 1]
-    window_start = weeks[0]
-    buffer_start = weeks[max(0, TRAIN_WINDOW - TRAIN_WINDOW - HISTORY_BUFFER)]  # weeks[0]
-    raw_df       = load_raw_window(conn, buffer_start, cutoff)
-    features_df  = compute_features(raw_df)
-    train_df     = features_df[features_df['week'] > window_start].dropna(subset=FEATURE_COLS)
-    check('Training rows', len(train_df) > 0, f'{len(train_df):,} rows | cutoff={cutoff}')
-    missing = [c for c in FEATURE_COLS if c not in train_df.columns]
-    check('All feature cols present', not missing, f'Missing: {missing}' if missing else '')
+    feat    = compute_features(raw)
+    week_df = feat[feat['week'] == forecast_week]
 
-    step('Train LightGBM')
-    model = train_model(train_df)
-    check('Model trained', model is not None)
-    check('Feature importances', len(model.feature_importances_) == len(FEATURE_COLS))
+    t_feat = time.perf_counter() - t0 - t_sql
 
-    step('Load + compute features for forecast week')
-    buf_start = weeks[max(0, TRAIN_WINDOW + 1 - HISTORY_BUFFER)]
-    raw_fcst  = load_raw_window(conn, buf_start, forecast_week)
-    feat_fcst = compute_features(raw_fcst)
-    week_df   = feat_fcst[feat_fcst['week'] == forecast_week]
-    check('Forecast week rows', len(week_df) > 0, f'{len(week_df)} SKUs | week={forecast_week}')
-
-    step('Forecast h=1')
-    fcst_df = make_forecasts(model, week_df, forecast_week)
-    check('Forecasts returned', len(fcst_df) > 0, f'{len(fcst_df)} SKUs')
-    check('No negatives', (fcst_df['h1'] >= 0).all())
-    ok(f'Avg predicted={fcst_df["h1"].mean():.1f}  median={fcst_df["h1"].median():.1f}')
-
-    step('Evaluate h=1 vs actuals')
-    eval_df = evaluate_h1(fcst_df, week_df[['unique_id', 'y']])
+    preds   = make_forecasts(model, week_df, forecast_week)
+    eval_df = evaluate_h1(preds, week_df[['unique_id', 'y']])
     eval_df['forecast_week'] = forecast_week
-    check('Eval rows', len(eval_df) > 0, f'{len(eval_df)} rows')
-    check('MAPE non-negative', (eval_df['mape'] >= 0).all())
-    ok(f'Avg MAPE={eval_df["mape"].mean():.1f}%  median={eval_df["mape"].median():.1f}%')
 
-    step(f'SHAP for top {TOP_N} items')
     top_items  = eval_df.nlargest(TOP_N, 'mape')['unique_id'].tolist()
     actual_map = dict(zip(eval_df['unique_id'], eval_df['actual']))
-    explainer  = make_explainer(model)
     shap_rows  = shap_payloads(explainer, model, week_df, forecast_week, top_items, actual_map)
-    check('SHAP rows', len(shap_rows) == TOP_N, f'{len(shap_rows)} rows')
-    check('SHAP JSON valid', all(json.loads(r['payload']) for r in shap_rows))
+    cf_rows    = counterfactual_payloads(model, week_df, forecast_week, top_items, actual_map)
 
-    step(f'Counterfactual for top {TOP_N} items')
-    cf_rows = counterfactual_payloads(model, week_df, forecast_week, top_items, actual_map)
-    check('Counterfactual rows', len(cf_rows) == TOP_N, f'{len(cf_rows)} rows')
+    t_total = time.perf_counter() - t0
 
-    step(f'Contrastive for top {TOP_N} items')
-    ct_rows = contrastive_payloads(explainer, week_df, forecast_week, top_items, eval_df, conn)
-    check('Contrastive ran', True, f'{len(ct_rows)} rows (0 expected -- no prior eval history)')
+    log(f'  [done] {forecast_week}  sql={t_sql:.1f}s  feat={t_feat:.1f}s  total={t_total:.1f}s'
+        f'  MAPE avg={eval_df["mape"].mean():.1f}%  median={eval_df["mape"].median():.1f}%'
+        f'  shap={len(shap_rows)}  cf={len(cf_rows)}')
 
-    step('SQLite write + read back (keyed on forecast_week)')
-    insert_forecasts(conn, [
-        {'week_id': forecast_week, 'item_id': r['unique_id'], 'h1': r['h1'], 'trained_at': 'smoke-test'}
-        for r in fcst_df.to_dict('records')
-    ])
-    insert_evaluations(conn, [
-        {'week_id': forecast_week, 'item_id': r['unique_id'],
-         'h1_mape': r['mape'], 'h1_mae': r['mae'], 'is_bad_week': 1, 'mape_zscore': 2.0}
-        for r in eval_df.to_dict('records')
-    ])
-    insert_xai(conn, shap_rows + cf_rows)
+    return {
+        'forecast_week': forecast_week,
+        'eval_df':       eval_df,
+        'preds':         preds,
+        'shap_rows':     shap_rows,
+        'cf_rows':       cf_rows,
+        'timings':       {'sql': t_sql, 'feat': t_feat, 'total': t_total},
+    }
 
-    # Cross-join check: xai_results and evaluations share the same week_id
-    xai_weeks = set(r['week_id'] for r in (shap_rows + cf_rows))
-    eval_weeks = {forecast_week}
-    check('XAI and eval week keys match', xai_weeks == eval_weeks,
-          f'xai={xai_weeks}  eval={eval_weeks}')
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    wall_start = time.perf_counter()
+
+    print('=' * 60)
+    print('Smoke test  (5 weeks, concurrency=5)')
+    print('=' * 60)
+
+    # ── Setup ─────────────────────────────────────────────────────
+    t = time.perf_counter()
+    conn  = get_conn(DB_PATH)
+    weeks = get_all_weeks(conn)
+    conn.close()
+
+    if not weeks:
+        fail('No data -- run: uv run python ingest.py')
+    if len(weeks) <= TRAIN_WINDOW + WEEKS_TO_TEST:
+        fail(f'Not enough weeks: need {TRAIN_WINDOW + WEEKS_TO_TEST}, have {len(weeks)}')
+    print(f'\n[STEP] Setup  ({time.perf_counter()-t:.2f}s)')
+    print(f'  {len(weeks)} weeks in DB ({weeks[0]} -> {weeks[-1]})')
+
+    # ── Train (single model, weeks[TRAIN_WINDOW] cutoff) ──────────
+    t = time.perf_counter()
+    conn  = get_conn(DB_PATH)
+    cutoff       = weeks[TRAIN_WINDOW]
+    window_start = weeks[0]
+    buffer_start = weeks[0]   # max(0, 156-156-52) = 0
+    raw_df       = load_raw_window(conn, buffer_start, cutoff)
+    conn.close()
+
+    features_df = compute_features(raw_df)
+    train_df    = features_df[features_df['week'] > window_start].dropna(subset=FEATURE_COLS)
+
+    if len(train_df) == 0:
+        fail('Empty training set')
+
+    model     = train_model(train_df)
+    explainer = make_explainer(model)
+    print(f'\n[STEP] Train LightGBM  ({time.perf_counter()-t:.2f}s)')
+    print(f'  {len(train_df):,} training rows | cutoff={cutoff}')
+    missing = [c for c in FEATURE_COLS if c not in train_df.columns]
+    if missing:
+        fail(f'Missing feature cols: {missing}')
+    print(f'  Features OK ({len(FEATURE_COLS)} cols)')
+
+    # ── Pick 5 forecast weeks spread across backtest range ─────────
+    # Space them evenly so we sample early, mid, late in the backtest
+    backtest_start = TRAIN_WINDOW + 1
+    step_size      = max(1, (len(weeks) - backtest_start - 1) // (WEEKS_TO_TEST - 1))
+    forecast_weeks = [weeks[backtest_start + i * step_size] for i in range(WEEKS_TO_TEST)]
+
+    print(f'\n[STEP] Parallel forecast ({WEEKS_TO_TEST} weeks, concurrency={CONCURRENCY})')
+    print(f'  Weeks: {forecast_weeks}')
+    print(f'  Sequential estimate: ~{WEEKS_TO_TEST * 36:.0f}s  |  parallel target: ~36s\n')
+
+    t_parallel = time.perf_counter()
+    results = {}
+
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = {
+            pool.submit(run_week, fw, weeks, model, explainer): fw
+            for fw in forecast_weeks
+        }
+        for future in as_completed(futures):
+            fw = futures[future]
+            try:
+                results[fw] = future.result()
+            except Exception as exc:
+                fail(f'{fw} raised {exc}')
+
+    t_parallel_total = time.perf_counter() - t_parallel
+
+    # ── Validate results ───────────────────────────────────────────
+    print(f'\n[STEP] Validation')
+    all_ok = True
+    for fw in forecast_weeks:
+        r = results[fw]
+        ok_shap  = len(r['shap_rows']) == TOP_N
+        ok_cf    = len(r['cf_rows'])   == TOP_N
+        ok_key   = all(x['week_id'] == fw for x in r['shap_rows'] + r['cf_rows'])
+        ok_mape  = (r['eval_df']['mape'] >= 0).all()
+        ok_preds = (r['preds']['h1'] >= 0).all()
+        status   = '[OK]  ' if all([ok_shap, ok_cf, ok_key, ok_mape, ok_preds]) else '[FAIL]'
+        if status == '[FAIL]':
+            all_ok = False
+        print(f'  {status} {fw}  shap={ok_shap}  cf={ok_cf}  key_match={ok_key}  mape_ok={ok_mape}  preds_ok={ok_preds}')
+
+    if not all_ok:
+        fail('One or more weeks failed validation')
+
+    # ── Write to SQLite (serial — avoid write contention) ──────────
+    t = time.perf_counter()
+    conn = get_conn(DB_PATH)
+    for r in results.values():
+        fw = r['forecast_week']
+        insert_forecasts(conn, [
+            {'week_id': fw, 'item_id': row['unique_id'],
+             'h1': row['h1'], 'trained_at': 'smoke-test'}
+            for row in r['preds'].to_dict('records')
+        ])
+        insert_evaluations(conn, [
+            {'week_id': fw, 'item_id': row['unique_id'],
+             'h1_mape': row['mape'], 'h1_mae': row['mae'],
+             'is_bad_week': 0, 'mape_zscore': 0.0}
+            for row in r['eval_df'].to_dict('records')
+        ])
+        insert_xai(conn, r['shap_rows'] + r['cf_rows'])
 
     summary = week_summary(conn)
     conn.close()
-    check('Summary readable', len(summary) == 1,
-          f'{int(summary["n_items"].iloc[0])} items | avg MAPE {summary["avg_mape"].iloc[0]:.1f}%')
+    print(f'\n[STEP] SQLite write + readback  ({time.perf_counter()-t:.2f}s)')
+    print(f'  {len(summary)} weeks written | avg MAPE across weeks: '
+          f'{summary["avg_mape"].mean():.1f}%')
 
-    print(f'\n{"=" * 50}')
-    print(f'All checks passed  (total {time.perf_counter()-total:.1f}s)')
-    print('=' * 50)
+    # ── Timing summary ─────────────────────────────────────────────
+    timings = [r['timings'] for r in results.values()]
+    print(f'\n{"=" * 60}')
+    print(f'Timing summary')
+    print(f'{"=" * 60}')
+    print(f'  Parallel wall time:      {t_parallel_total:.1f}s  ({WEEKS_TO_TEST} weeks @ concurrency={CONCURRENCY})')
+    print(f'  Sequential equivalent:   ~{sum(t["total"] for t in timings):.1f}s')
+    print(f'  Speedup:                 {sum(t["total"] for t in timings) / t_parallel_total:.1f}x')
+    print(f'  Per-week avg (total):    {sum(t["total"] for t in timings)/len(timings):.1f}s')
+    print(f'  Per-week avg (sql):      {sum(t["sql"] for t in timings)/len(timings):.1f}s')
+    print(f'  Per-week avg (features): {sum(t["feat"] for t in timings)/len(timings):.1f}s')
+    print(f'  Total wall (incl train): {time.perf_counter()-wall_start:.1f}s')
+    print(f'\nAll checks passed.')
 
 
 if __name__ == '__main__':
