@@ -5,11 +5,25 @@ import pandas as pd
 DB_PATH = Path('db/forecasting.db')
 
 _DDL = """
+CREATE TABLE IF NOT EXISTS features (
+    week        TEXT NOT NULL,
+    unique_id   TEXT NOT NULL,
+    y           REAL,
+    lag_1 REAL, lag_2 REAL, lag_4 REAL, lag_8 REAL, lag_52 REAL,
+    rolling_4_mean REAL, rolling_8_mean REAL, rolling_13_mean REAL, rolling_4_std REAL,
+    week_of_year INTEGER, month INTEGER, year INTEGER,
+    snap INTEGER, has_event INTEGER, event_type_enc INTEGER,
+    sell_price REAL, price_change_pct REAL,
+    dept_enc INTEGER, cat_enc INTEGER,
+    PRIMARY KEY (week, unique_id)
+);
+CREATE INDEX IF NOT EXISTS idx_features_week    ON features(week);
+CREATE INDEX IF NOT EXISTS idx_features_uid     ON features(unique_id);
 CREATE TABLE IF NOT EXISTS forecasts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     week_id     TEXT NOT NULL,
     item_id     TEXT NOT NULL,
-    h1 REAL, h2 REAL, h3 REAL,
+    h1          REAL,
     trained_at  TEXT
 );
 CREATE TABLE IF NOT EXISTS actuals (
@@ -53,10 +67,34 @@ def init_db(path: str | Path = DB_PATH) -> None:
         conn.executescript(_DDL)
 
 
+def insert_features(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
+    df.to_sql('features', conn, if_exists='append', index=False, chunksize=10_000)
+    conn.commit()
+
+
+def load_features_window(conn: sqlite3.Connection, week_start: str, week_end: str) -> pd.DataFrame:
+    return pd.read_sql(
+        "SELECT * FROM features WHERE week > ? AND week <= ?",
+        conn, params=(week_start, week_end),
+    )
+
+
+def load_features_week(conn: sqlite3.Connection, week: str) -> pd.DataFrame:
+    return pd.read_sql(
+        "SELECT * FROM features WHERE week = ?",
+        conn, params=(week,),
+    )
+
+
+def get_weeks(conn: sqlite3.Connection) -> list[str]:
+    cur = conn.execute("SELECT DISTINCT week FROM features ORDER BY week")
+    return [r[0] for r in cur.fetchall()]
+
+
 def insert_forecasts(conn: sqlite3.Connection, rows: list[dict]) -> None:
     conn.executemany(
-        "INSERT INTO forecasts (week_id, item_id, h1, h2, h3, trained_at) "
-        "VALUES (:week_id, :item_id, :h1, :h2, :h3, :trained_at)",
+        "INSERT INTO forecasts (week_id, item_id, h1, trained_at) "
+        "VALUES (:week_id, :item_id, :h1, :trained_at)",
         rows,
     )
     conn.commit()

@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import numpy as np
 import pandas as pd
 import shap
@@ -20,14 +21,12 @@ def make_explainer(model: lgb.LGBMRegressor) -> shap.TreeExplainer:
 def shap_payloads(
     explainer: shap.TreeExplainer,
     model: lgb.LGBMRegressor,
-    df: pd.DataFrame,
-    h1_week: pd.Timestamp,
+    week_df: pd.DataFrame,
+    forecast_week: str,
     items: list[str],
     actual_map: dict[str, float],
 ) -> list[dict]:
-    rows = df[(df['week'] == h1_week) & (df['unique_id'].isin(items))][
-        ['unique_id'] + FEATURE_COLS
-    ].fillna(0)
+    rows = week_df[week_df['unique_id'].isin(items)][['unique_id'] + FEATURE_COLS].fillna(0)
     if rows.empty:
         return []
 
@@ -41,7 +40,7 @@ def shap_payloads(
         top_idx = np.argsort(np.abs(sv[i]))[::-1][:5]
         actual = actual_map.get(uid, np.nan)
         results.append({
-            'week_id': str(h1_week.date()),
+            'week_id': forecast_week,
             'item_id': uid,
             'xai_type': 'shap',
             'payload': json.dumps({
@@ -64,21 +63,18 @@ def shap_payloads(
 
 def counterfactual_payloads(
     model: lgb.LGBMRegressor,
-    df: pd.DataFrame,
-    h1_week: pd.Timestamp,
+    week_df: pd.DataFrame,
+    forecast_week: str,
     items: list[str],
     actual_map: dict[str, float],
 ) -> list[dict]:
-    rows = df[(df['week'] == h1_week) & (df['unique_id'].isin(items))][
-        ['unique_id'] + FEATURE_COLS
-    ].fillna(0).reset_index(drop=True)
+    rows = week_df[week_df['unique_id'].isin(items)][['unique_id'] + FEATURE_COLS].fillna(0).reset_index(drop=True)
     if rows.empty:
         return []
 
     X_orig = rows[FEATURE_COLS].copy()
     preds_orig = model.predict(X_orig.values).clip(min=0)
 
-    # Collect per-scenario predictions
     cf_preds: dict[str, np.ndarray] = {}
     for scenario, overrides in _CF_PERTURBATIONS:
         X_cf = X_orig.copy()
@@ -91,23 +87,22 @@ def counterfactual_payloads(
     for i, uid in enumerate(rows['unique_id']):
         actual = actual_map.get(uid, np.nan)
         orig = float(preds_orig[i])
-        scenarios = []
-        for scenario, _ in _CF_PERTURBATIONS:
-            cf = float(cf_preds[scenario][i])
-            scenarios.append({
-                'scenario': scenario,
-                'prediction_cf': round(cf, 4),
-                'delta': round(cf - orig, 4),
-                'delta_pct': round((cf - orig) / orig * 100 if orig > 0 else 0, 2),
-            })
         results.append({
-            'week_id': str(h1_week.date()),
+            'week_id': forecast_week,
             'item_id': uid,
             'xai_type': 'counterfactual',
             'payload': json.dumps({
                 'prediction_original': round(orig, 4),
                 'actual': round(float(actual), 4) if not np.isnan(actual) else None,
-                'scenarios': scenarios,
+                'scenarios': [
+                    {
+                        'scenario': scenario,
+                        'prediction_cf': round(float(cf_preds[scenario][i]), 4),
+                        'delta': round(float(cf_preds[scenario][i]) - orig, 4),
+                        'delta_pct': round((float(cf_preds[scenario][i]) - orig) / orig * 100 if orig > 0 else 0, 2),
+                    }
+                    for scenario, _ in _CF_PERTURBATIONS
+                ],
             }),
         })
     return results
@@ -115,44 +110,55 @@ def counterfactual_payloads(
 
 def contrastive_payloads(
     explainer: shap.TreeExplainer,
-    df: pd.DataFrame,
-    h1_week: pd.Timestamp,
+    week_df: pd.DataFrame,
+    forecast_week: str,
     items: list[str],
     all_evals: pd.DataFrame,
+    conn: sqlite3.Connection,
 ) -> list[dict]:
     """
-    For each bad item, find the most recent good week with similar seasonality
-    (same week-of-year, MAPE < 15%) and diff the SHAP profiles.
+    For each bad item find a good reference week (same week-of-year, MAPE < 15%)
+    and diff the SHAP profiles. Fetches reference feature rows from SQLite.
     """
-    bad_woy = h1_week.isocalendar()[1]
+    from xai_forecast.db import load_features_week
+
+    bad_woy = pd.Timestamp(forecast_week).isocalendar()[1]
     results = []
 
     for uid in items:
-        item_df = df[df['unique_id'] == uid].set_index('week').sort_index()
-
         good_weeks = all_evals[
-            (all_evals['unique_id'] == uid)
-            & (all_evals['mape'] < 15)
+            (all_evals['unique_id'] == uid) & (all_evals['mape'] < 15)
         ].copy()
         if good_weeks.empty:
             continue
 
-        # Prefer same week-of-year, else fall back to any good week
         same_woy = good_weeks[
             good_weeks['cutoff_week'].apply(
-                lambda w: (w + pd.Timedelta(weeks=1)).isocalendar()[1] == bad_woy
+                lambda w: pd.Timestamp(w + ' 00:00:00' if isinstance(w, str) else w).isocalendar()[1] == bad_woy
+                if isinstance(w, str) else w.isocalendar()[1] == bad_woy
             )
         ]
         ref_row = same_woy.iloc[-1] if not same_woy.empty else good_weeks.iloc[-1]
-        good_week = ref_row['cutoff_week'] + pd.Timedelta(weeks=1)
 
-        bad_X = item_df.loc[item_df.index == h1_week, FEATURE_COLS]
-        good_X = item_df.loc[item_df.index == good_week, FEATURE_COLS]
-        if bad_X.empty or good_X.empty:
+        # cutoff_week is the training cutoff; the forecast week is one week later
+        ref_cutoff = ref_row['cutoff_week']
+        if isinstance(ref_cutoff, str):
+            ref_forecast_week = (pd.Timestamp(ref_cutoff) + pd.Timedelta(weeks=1)).strftime('%Y-%m-%d')
+        else:
+            ref_forecast_week = (ref_cutoff + pd.Timedelta(weeks=1)).strftime('%Y-%m-%d')
+
+        ref_df = load_features_week(conn, ref_forecast_week)
+        ref_item = ref_df[ref_df['unique_id'] == uid]
+        bad_item = week_df[week_df['unique_id'] == uid]
+
+        if ref_item.empty or bad_item.empty:
             continue
 
-        X_both = pd.concat([bad_X, good_X], ignore_index=True).fillna(0)
-        sv = explainer.shap_values(X_both[FEATURE_COLS].values)
+        X_both = pd.concat(
+            [bad_item[FEATURE_COLS].fillna(0), ref_item[FEATURE_COLS].fillna(0)],
+            ignore_index=True,
+        )
+        sv = explainer.shap_values(X_both.values)
 
         diffs = sorted(
             [
@@ -171,12 +177,12 @@ def contrastive_payloads(
         )
 
         results.append({
-            'week_id': str(h1_week.date()),
+            'week_id': forecast_week,
             'item_id': uid,
             'xai_type': 'contrastive',
             'payload': json.dumps({
-                'bad_week': str(h1_week.date()),
-                'good_week': str(good_week.date()),
+                'bad_week': forecast_week,
+                'good_week': ref_forecast_week,
                 'good_week_mape': round(float(ref_row['mape']), 2),
                 'top_diffs': diffs[:5],
             }),
