@@ -11,39 +11,36 @@ Core question: **"Leader sees the model performed badly at week X — why?"**
 ## Pipeline (run in order)
 
 ```bash
-uv run python migrate.py          # create/upgrade DB schema (safe to re-run)
-uv run python ingest.py           # download M5, write raw tables (once)
-uv run python build_features.py   # engineer features from raw tables (once)
-uv run python smoke_test.py       # verify one full cycle before full run
-uv run python backtest.py         # full backtest (~125 weeks, ~31 retrains)
-uv run streamlit run app.py       # dashboard at localhost:8501
+uv run python migrate.py     # create/upgrade DB schema (safe to re-run)
+uv run python ingest.py      # download M5, write raw tables (once)
+uv run python smoke_test.py  # verify one full cycle before full run
+uv run python backtest.py    # full backtest (~125 weeks, ~31 retrains)
+uv run streamlit run app.py  # dashboard at localhost:8501
 ```
 
 ## Architecture
 
 ```
-migrate.py          Applies migrations/*.sql in order, tracks in schema_migrations
-ingest.py           M5 download → weekly_sales, calendar, prices, item_meta (raw, no features)
-build_features.py   Raw tables → features table (lags, rolling, price, calendar)
-backtest.py         Expanding-window backtest, reads/writes SQLite only
-smoke_test.py       Single-cycle sanity check with per-step timing
-app.py              Streamlit dashboard
+migrate.py        Applies migrations/*.sql in order, tracks in schema_migrations
+ingest.py         M5 download → weekly_sales, calendar, prices, item_meta (raw, no features)
+backtest.py       At each iteration: SQL → compute_features() → train → forecast → evaluate → xai
+smoke_test.py     Single-cycle sanity check with per-step timing
+app.py            Streamlit dashboard
 
 xai_forecast/
-  features.py       FEATURE_COLS list + constants (no data loading)
-  db.py             SQLite helpers — get_conn, insert_*, load_*, week_summary
-  train.py          train_model(df) → LGBMRegressor
-  forecast.py       make_forecasts(model, week_df, week) → [unique_id, h1]
-  evaluate.py       evaluate_h1, flag_bad_weeks (rolling z-score)
-  xai.py            shap_payloads, counterfactual_payloads, contrastive_payloads
+  features.py     FEATURE_COLS, constants, compute_features(raw_df) — called at runtime
+  db.py           SQLite helpers — get_conn, load_raw_window, insert_*, week_summary
+  train.py        train_model(df) → LGBMRegressor
+  forecast.py     make_forecasts(model, week_df, week) → [unique_id, h1]
+  evaluate.py     evaluate_h1, flag_bad_weeks (rolling z-score)
+  xai.py          shap_payloads, counterfactual_payloads, contrastive_payloads
 
 migrations/
-  001_raw_tables.sql      weekly_sales, calendar, prices, item_meta
-  002_features_table.sql  features (with indexes)
-  003_output_tables.sql   forecasts, evaluations, xai_results (with indexes)
+  001_raw_tables.sql    weekly_sales, calendar, prices, item_meta (+ indexes)
+  002_output_tables.sql forecasts, evaluations, xai_results (+ indexes)
 
-data/               M5 raw files (gitignored — downloaded by ingest.py)
-db/                 SQLite database (gitignored)
+data/             M5 raw files (gitignored — downloaded by ingest.py)
+db/               SQLite database (gitignored)
 ```
 
 ## SQLite tables
@@ -54,7 +51,6 @@ db/                 SQLite database (gitignored)
 | `calendar` | ingest.py | SNAP, event flags per week |
 | `prices` | ingest.py | Weekly avg sell price per SKU |
 | `item_meta` | ingest.py | dept_enc, cat_enc per SKU (static) |
-| `features` | build_features.py | Full feature matrix — what backtest reads |
 | `forecasts` | backtest.py | h=1 predictions per SKU per cutoff week |
 | `evaluations` | backtest.py | MAPE, MAE, bad-week flag per SKU per week |
 | `xai_results` | backtest.py | JSON payloads: shap / counterfactual / contrastive |

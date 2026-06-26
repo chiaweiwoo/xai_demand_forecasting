@@ -19,6 +19,36 @@ def init_db(path: str | Path = DB_PATH) -> None:
     migrate.run(str(path))
 
 
+# ── Raw data reads (used by backtest at each iteration) ──────────────────────
+
+def load_raw_window(conn: sqlite3.Connection, week_start: str, week_end: str) -> pd.DataFrame:
+    """
+    Join weekly_sales + calendar + prices + item_meta for weeks (week_start, week_end].
+    Used by backtest to build the feature matrix for one training window.
+    week_start should be buffer_start (window_start - 52 weeks) so lag_52 is correct.
+    """
+    return pd.read_sql(
+        """
+        SELECT ws.week, ws.unique_id, ws.y,
+               c.snap, c.has_event, c.event_type_enc,
+               p.sell_price,
+               m.dept_enc, m.cat_enc
+        FROM weekly_sales ws
+        LEFT JOIN calendar  c ON c.week      = ws.week
+        LEFT JOIN prices    p ON p.week      = ws.week AND p.unique_id = ws.unique_id
+        LEFT JOIN item_meta m ON m.unique_id = ws.unique_id
+        WHERE ws.week > ? AND ws.week <= ?
+        ORDER BY ws.unique_id, ws.week
+        """,
+        conn, params=(week_start, week_end),
+    )
+
+
+def get_all_weeks(conn: sqlite3.Connection) -> list[str]:
+    cur = conn.execute('SELECT DISTINCT week FROM weekly_sales ORDER BY week')
+    return [r[0] for r in cur.fetchall()]
+
+
 # ── Ingest writes ─────────────────────────────────────────────────────────────
 
 def insert_raw(conn: sqlite3.Connection, weekly_sales: pd.DataFrame,
@@ -30,31 +60,6 @@ def insert_raw(conn: sqlite3.Connection, weekly_sales: pd.DataFrame,
     item_meta.to_sql('item_meta',       conn, if_exists='append', index=False, chunksize=10_000)
     conn.commit()
 
-
-# ── Feature writes / reads ────────────────────────────────────────────────────
-
-def insert_features(conn: sqlite3.Connection, df: pd.DataFrame) -> None:
-    df.to_sql('features', conn, if_exists='append', index=False, chunksize=10_000)
-    conn.commit()
-
-
-def get_weeks(conn: sqlite3.Connection) -> list[str]:
-    cur = conn.execute('SELECT DISTINCT week FROM features ORDER BY week')
-    return [r[0] for r in cur.fetchall()]
-
-
-def load_features_window(conn: sqlite3.Connection, week_start: str, week_end: str) -> pd.DataFrame:
-    return pd.read_sql(
-        'SELECT * FROM features WHERE week > ? AND week <= ?',
-        conn, params=(week_start, week_end),
-    )
-
-
-def load_features_week(conn: sqlite3.Connection, week: str) -> pd.DataFrame:
-    return pd.read_sql(
-        'SELECT * FROM features WHERE week = ?',
-        conn, params=(week,),
-    )
 
 
 # ── Backtest writes ───────────────────────────────────────────────────────────

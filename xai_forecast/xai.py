@@ -147,7 +147,18 @@ def contrastive_payloads(
         else:
             ref_forecast_week = (ref_cutoff + pd.Timedelta(weeks=1)).strftime('%Y-%m-%d')
 
-        ref_df = load_features_week(conn, ref_forecast_week)
+        from xai_forecast.db import load_raw_window
+        from xai_forecast.features import compute_features, HISTORY_BUFFER
+        all_weeks = sorted(pd.read_sql(
+            "SELECT DISTINCT week FROM weekly_sales ORDER BY week", conn
+        )['week'].tolist())
+        ref_step = all_weeks.index(ref_forecast_week) if ref_forecast_week in all_weeks else -1
+        if ref_step < 0:
+            continue
+        buf = all_weeks[max(0, ref_step - HISTORY_BUFFER)]
+        ref_raw = load_raw_window(conn, buf, ref_forecast_week)
+        ref_full = compute_features(ref_raw)
+        ref_df   = ref_full[ref_full['week'] == ref_forecast_week]
         ref_item = ref_df[ref_df['unique_id'] == uid]
         bad_item = week_df[week_df['unique_id'] == uid]
 
