@@ -1,6 +1,6 @@
 """
-Smoke test: train once, then run 5 forecast weeks in parallel (concurrency=5).
-Requires ingest.py to have run first.
+Smoke test: train once, then run 10 forecast weeks in parallel (concurrency=10).
+Requires ingest.py and build_features.py to have run first.
 
 Usage:
     uv run python smoke_test.py
@@ -23,8 +23,8 @@ from xai_forecast.evaluate import evaluate_h1
 from xai_forecast.xai import make_explainer, shap_payloads, counterfactual_payloads
 
 TRAIN_WINDOW  = 156
-WEEKS_TO_TEST = 5
-CONCURRENCY   = 5
+WEEKS_TO_TEST = 10
+CONCURRENCY   = 10
 TOP_N         = 5
 SOURCE_DB     = 'db/forecasting.db'   # raw data + feature store (read-only)
 SMOKE_DB      = 'db/smoke.db'         # throwaway output — never read by dashboard
@@ -86,7 +86,7 @@ def main() -> None:
     wall_start = time.perf_counter()
 
     print('=' * 60)
-    print('Smoke test  (5 weeks, concurrency=5)')
+    print(f'Smoke test  ({WEEKS_TO_TEST} weeks, concurrency={CONCURRENCY})')
     print('=' * 60)
 
     # ── Setup ─────────────────────────────────────────────────────
@@ -125,11 +125,11 @@ def main() -> None:
         fail(f'Missing feature cols: {missing}')
     print(f'  Features OK ({len(FEATURE_COLS)} cols)')
 
-    # ── Pick 5 forecast weeks spread across backtest range ─────────
-    # Space them evenly so we sample early, mid, late in the backtest
-    backtest_start = TRAIN_WINDOW + 1
-    step_size      = max(1, (len(weeks) - backtest_start - 1) // (WEEKS_TO_TEST - 1))
-    forecast_weeks = [weeks[backtest_start + i * step_size] for i in range(WEEKS_TO_TEST)]
+    # ── Pick forecast weeks spread across backtest range ──────────
+    # Exclude weeks[-1] (partial 2-day week) from the selection pool.
+    valid_weeks = weeks[TRAIN_WINDOW + 1:-1]
+    step_size   = max(1, (len(valid_weeks) - 1) // (WEEKS_TO_TEST - 1))
+    forecast_weeks = [valid_weeks[i * step_size] for i in range(WEEKS_TO_TEST)]
 
     print(f'\n[STEP] Parallel forecast ({WEEKS_TO_TEST} weeks, concurrency={CONCURRENCY})')
     print(f'  Weeks: {forecast_weeks}')

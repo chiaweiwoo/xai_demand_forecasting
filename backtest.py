@@ -54,7 +54,9 @@ def main() -> None:
         return
 
     print(f'{len(weeks)} weeks ({weeks[0]} -> {weeks[-1]})')
-    backtest_weeks = weeks[TRAIN_WINDOW:-1]
+    # Exclude weeks[-1] — the M5 eval file ends mid-week (only 2 days), making it a partial
+    # week with artificially low sales. Forecasting it produces spurious bad-week flags.
+    backtest_weeks = weeks[TRAIN_WINDOW:-2]
     print(f'Backtest: {len(backtest_weeks)} weeks | ~{len(backtest_weeks) // RETRAIN_FREQ} retrains\n')
 
     # Clean slate — ensures no orphan rows from previous or partial runs
@@ -107,8 +109,9 @@ def main() -> None:
 
     print('\nComputing XAI...')
     # Single model on most recent 3-year window (see module docstring for caveat)
+    # Exclude weeks[-1] (partial week) from training targets too
     window_start = weeks[-TRAIN_WINDOW - 1]
-    train_df     = load_features_window(conn, window_start, weeks[-1]).dropna(subset=FEATURE_COLS)
+    train_df     = load_features_window(conn, window_start, weeks[-2]).dropna(subset=FEATURE_COLS)
     model        = train_model(train_df)
     explainer    = make_explainer(model)
 
@@ -122,7 +125,7 @@ def main() -> None:
         xai_rows = (
             shap_payloads(explainer, model, week_df, forecast_week, top_items, actual_map)
             + counterfactual_payloads(model, week_df, forecast_week, top_items, actual_map)
-            + contrastive_payloads(explainer, week_df, forecast_week, top_items, week_evals, conn)
+            + contrastive_payloads(explainer, week_df, forecast_week, top_items, all_evals_df, conn)
         )
         if xai_rows:
             insert_xai(conn, xai_rows)

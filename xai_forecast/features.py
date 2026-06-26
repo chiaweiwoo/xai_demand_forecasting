@@ -32,11 +32,12 @@ def compute_features(raw_df: pd.DataFrame) -> pd.DataFrame:
     raw_df columns: week, unique_id, y, snap, has_event, event_type_enc,
                     sell_price, dept_mean_sales, cat_mean_sales
 
-    Leakage guarantees:
+    Leakage controls:
     - lag_*: shift(n) per SKU — lag_1 at week t uses sales[t-1]
     - rolling_*: shift(1).rolling(w) — excludes current week
-    - sell_price NaN: ffill within item (last known price)
-    - dept_mean_sales / cat_mean_sales: static precomputed priors, no temporal component
+    - sell_price NaN: ffill within item only — no backward fill, no future data
+    - dept_mean_sales / cat_mean_sales: static prior over full history (deliberate mild
+      lookahead accepted for stability — 7 dept / 3 cat scalars, low signal risk)
     """
     warnings.filterwarnings('ignore', category=FutureWarning)
     warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -66,9 +67,10 @@ def compute_features(raw_df: pd.DataFrame) -> pd.DataFrame:
     df['has_event']      = df['has_event'].fillna(0).astype(int)
     df['event_type_enc'] = df['event_type_enc'].fillna(0).astype(int)
 
-    # Price — ffill within item (last known price, no future data)
+    # Price — ffill within item only (last known price, no future data).
+    # Pre-launch NaNs stay NaN and are dropped via dropna(FEATURE_COLS) at training time.
     df['sell_price'] = df.groupby('unique_id')['sell_price'].transform(
-        lambda x: x.ffill().bfill()
+        lambda x: x.ffill()
     )
     df['price_change_pct'] = df.groupby('unique_id')['sell_price'].transform(
         lambda x: x.pct_change(fill_method=None).fillna(0).clip(-1, 2)

@@ -32,7 +32,9 @@ def shap_payloads(
 
     X = rows[FEATURE_COLS]
     sv = explainer.shap_values(X)
-    base = float(explainer.expected_value)
+    # Tweedie uses log-link: base_value and shap_values are in log-margin space.
+    # base_log + sum(shap_values) = log(prediction). Feature ranking by |shap| is correct.
+    base_log = float(explainer.expected_value)
     preds = model.predict(X).clip(min=0)
 
     results = []
@@ -44,10 +46,11 @@ def shap_payloads(
             'item_id': uid,
             'xai_type': 'shap',
             'payload': json.dumps({
-                'base_value': round(base, 4),
+                'base_value_log': round(base_log, 4),
                 'prediction': round(float(preds[i]), 4),
                 'actual': round(float(actual), 4) if not np.isnan(actual) else None,
                 'error_pct': round(abs(float(preds[i]) - actual) / actual * 100, 2) if actual > 0 else None,
+                'shap_note': 'values in log-margin space (Tweedie log-link); ranking by |shap| is valid',
                 'top_features': [
                     {
                         'feature': FEATURE_COLS[j],
