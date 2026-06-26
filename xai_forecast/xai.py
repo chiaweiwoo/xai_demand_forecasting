@@ -120,8 +120,6 @@ def contrastive_payloads(
     For each bad item find a good reference week (same week-of-year, MAPE < 15%)
     and diff the SHAP profiles. Fetches reference feature rows from SQLite.
     """
-    from xai_forecast.db import load_features_week
-
     bad_woy = pd.Timestamp(forecast_week).isocalendar()[1]
     results = []
 

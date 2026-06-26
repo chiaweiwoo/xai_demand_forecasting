@@ -1,6 +1,6 @@
 """
 Smoke test: one full train/forecast/evaluate/xai cycle.
-Requires migrate.py + ingest.py to have run first.
+Requires ingest.py to have run first. Schema is created automatically by get_conn().
 
 Usage:
     uv run python smoke_test.py
@@ -58,13 +58,15 @@ def main() -> None:
     conn  = get_conn(DB_PATH)
     weeks = get_all_weeks(conn)
     if not weeks:
-        fail('No data — run migrate.py then ingest.py first')
+        fail('No data — run: uv run python ingest.py')
     check('Weeks in DB', len(weeks) > TRAIN_WINDOW, f'{len(weeks)} weeks')
 
     step(f'Load raw window + compute features (train window)')
     cutoff       = weeks[TRAIN_WINDOW]
     window_start = weeks[0]
-    buffer_start = weeks[max(0, TRAIN_WINDOW - HISTORY_BUFFER)]
+    # Need buffer before window_start so lag_52 is populated for first training week.
+    # At step=TRAIN_WINDOW, step - TRAIN_WINDOW - HISTORY_BUFFER = -52, clamped to 0.
+    buffer_start = weeks[max(0, TRAIN_WINDOW - TRAIN_WINDOW - HISTORY_BUFFER)]  # weeks[0]
     raw_df       = load_raw_window(conn, buffer_start, cutoff)
     features_df  = compute_features(raw_df)
     train_df     = features_df[features_df['week'] > window_start].dropna(subset=FEATURE_COLS)

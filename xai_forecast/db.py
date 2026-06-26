@@ -3,20 +3,24 @@ from pathlib import Path
 import pandas as pd
 
 DB_PATH = Path('db/forecasting.db')
+_MIGRATIONS_DIR = Path(__file__).parent.parent / 'migrations'
+
+
+def _setup_schema(conn: sqlite3.Connection) -> None:
+    """Apply all migrations/*.sql in sorted order. All statements use IF NOT EXISTS."""
+    for path in sorted(_MIGRATIONS_DIR.glob('*.sql')):
+        conn.executescript(path.read_text())
 
 
 def get_conn(path: str | Path = DB_PATH) -> sqlite3.Connection:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA synchronous=NORMAL')
+    _setup_schema(conn)
     return conn
-
-
-def init_db(path: str | Path = DB_PATH) -> None:
-    """Run all pending migrations to initialise or upgrade the DB."""
-    import migrate
-    migrate.run(str(path))
 
 
 # ── Raw data reads (used by backtest at each iteration) ──────────────────────

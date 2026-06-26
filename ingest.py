@@ -9,7 +9,7 @@ Usage:
 """
 
 import pandas as pd
-from xai_forecast.db import init_db, get_conn, insert_raw
+from xai_forecast.db import get_conn, insert_raw
 
 STORE = 'CA_1'
 SNAP_STATE = 'CA'
@@ -87,7 +87,6 @@ def main() -> None:
     print(f'  item_meta: {len(item_meta)} items')
 
     print('\nWriting to SQLite...')
-    init_db(DB_PATH)
     conn = get_conn(DB_PATH)
 
     # Guard: skip if already ingested
@@ -102,7 +101,6 @@ def main() -> None:
 
     n = len(weekly_sales)
     print(f'Done. {n:,} rows written to {DB_PATH}')
-    print('Next: uv run python build_features.py')
 
 
 if __name__ == '__main__':

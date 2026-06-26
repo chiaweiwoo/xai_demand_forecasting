@@ -1,5 +1,5 @@
 """
-Full backtesting simulation. Run migrate.py + ingest.py first.
+Full backtesting simulation. Run ingest.py first.
 
 Usage:
     uv run python backtest.py
@@ -13,7 +13,7 @@ from tqdm import tqdm
 import pandas as pd
 
 from xai_forecast.db import (
-    init_db, get_conn, get_all_weeks, load_raw_window,
+    get_conn, get_all_weeks, load_raw_window,
     insert_forecasts, insert_evaluations, insert_xai,
 )
 from xai_forecast.features import compute_features, FEATURE_COLS, HISTORY_BUFFER
@@ -33,7 +33,7 @@ def main() -> None:
     weeks = get_all_weeks(conn)
 
     if not weeks:
-        print('No data. Run: uv run python migrate.py && uv run python ingest.py')
+        print('No data. Run: uv run python ingest.py')
         return
 
     print(f'{len(weeks)} weeks ({weeks[0]} → {weeks[-1]})')

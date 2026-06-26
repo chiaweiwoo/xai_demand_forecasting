@@ -11,8 +11,7 @@ Core question: **"Leader sees the model performed badly at week X — why?"**
 ## Pipeline (run in order)
 
 ```bash
-uv run python migrate.py     # create/upgrade DB schema (safe to re-run)
-uv run python ingest.py      # download M5, write raw tables (once)
+uv run python ingest.py      # download M5, write raw tables (once) — also creates schema
 uv run python smoke_test.py  # verify one full cycle before full run
 uv run python backtest.py    # full backtest (~125 weeks, ~31 retrains)
 uv run streamlit run app.py  # dashboard at localhost:8501
@@ -21,7 +20,6 @@ uv run streamlit run app.py  # dashboard at localhost:8501
 ## Architecture
 
 ```
-migrate.py        Applies migrations/*.sql in order, tracks in schema_migrations
 ingest.py         M5 download → weekly_sales, calendar, prices, item_meta (raw, no features)
 backtest.py       At each iteration: SQL → compute_features() → train → forecast → evaluate → xai
 smoke_test.py     Single-cycle sanity check with per-step timing
@@ -29,7 +27,7 @@ app.py            Streamlit dashboard
 
 xai_forecast/
   features.py     FEATURE_COLS, constants, compute_features(raw_df) — called at runtime
-  db.py           SQLite helpers — get_conn, load_raw_window, insert_*, week_summary
+  db.py           SQLite helpers — get_conn (auto-applies schema), load_raw_window, insert_*, week_summary
   train.py        train_model(df) → LGBMRegressor
   forecast.py     make_forecasts(model, week_df, week) → [unique_id, h1]
   evaluate.py     evaluate_h1, flag_bad_weeks (rolling z-score)
@@ -42,6 +40,8 @@ migrations/
 data/             M5 raw files (gitignored — downloaded by ingest.py)
 db/               SQLite database (gitignored)
 ```
+
+Schema is applied automatically by `get_conn()` via `_setup_schema()` — no separate migration step needed. To add schema changes: add `00N_description.sql` to `migrations/`. Never edit existing migration files.
 
 ## SQLite tables
 
@@ -61,7 +61,19 @@ db/               SQLite database (gitignored)
 
 **Training window:** Fixed 3-year (156-week) sliding window. Retrain every 4 weeks (`RETRAIN_FREQ`).
 
-**Leakage controls (in build_features.py):**
+**Week ID:** Monday of each week (`dt.to_period('W').dt.start_time` — ISO week, Monday anchor).
+
+**Features (19 total):**
+- Lags (5): lag_1, lag_2, lag_4, lag_8, lag_52 — lag_52 is the same-week-last-year seasonality anchor
+- Rolling (4): rolling_4/8/13_mean, rolling_4_std — all use `shift(1)` before `.rolling()` to exclude current week
+- Calendar (3): week_of_year, month, year
+- Store context (3): snap, has_event, event_type_enc
+- Price (2): sell_price (ffill within item), price_change_pct
+- Item metadata (2): dept_enc, cat_enc — label-encoded integers; LightGBM handles these natively without one-hot
+
+**HISTORY_BUFFER = 52:** Extra weeks fetched before the training window so lag_52 is non-NaN for the first training week. Not part of training — rows before window_start are dropped after dropna.
+
+**Leakage controls:**
 - Lag features: `shift(n)` — lag_1 at week t = sales[t-1]
 - Rolling features: `shift(1).rolling(w)` — excludes current week
 - `sell_price` NaN: `ffill` within item (last known price, not global median)
@@ -73,8 +85,6 @@ db/               SQLite database (gitignored)
 - `shap`: TreeSHAP waterfall — what drove the prediction
 - `counterfactual`: zero out SNAP/event/price-change → measure prediction delta
 - `contrastive`: compare SHAP profile vs a similar good week (same week-of-year, MAPE < 15%)
-
-**Adding a migration:** Add `00N_description.sql` to `migrations/`, run `migrate.py`. Never edit applied migrations.
 
 ## Stack
 
