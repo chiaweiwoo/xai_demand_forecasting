@@ -4,63 +4,85 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Retrospective XAI demand forecasting system using the M5 (Walmart) dataset.
+Retrospective XAI demand forecasting on the M5 (Walmart) dataset.
 
-The core question it answers: **"Leader sees the model performed badly at week X — why?"**
+Core question: **"Leader sees the model performed badly at week X — why?"**
 
-Weekly backtest loop: train LightGBM on expanding history → forecast 3 weeks → compare actual vs predicted → flag bad weeks (MAPE z-score ≥ 1.5) → run XAI on the worst 50 items per bad week → write everything to SQLite → display in Streamlit.
-
-## Commands
+## Pipeline (run in order)
 
 ```bash
-# Install deps
-uv sync
-
-# Download M5 data and run full backtest (~10–20 min)
-uv run python backtest.py
-
-# Launch dashboard
-uv run streamlit run app.py
+uv run python migrate.py          # create/upgrade DB schema (safe to re-run)
+uv run python ingest.py           # download M5, write raw tables (once)
+uv run python build_features.py   # engineer features from raw tables (once)
+uv run python smoke_test.py       # verify one full cycle before full run
+uv run python backtest.py         # full backtest (~125 weeks, ~31 retrains)
+uv run streamlit run app.py       # dashboard at localhost:8501
 ```
 
 ## Architecture
 
 ```
-xai_forecast/       Python package
-  features.py       M5 data loading, weekly aggregation, feature engineering
-  db.py             SQLite helpers (init_db, insert_*, load_*, week_summary)
-  train.py          LightGBM wrapper (train_model)
-  forecast.py       make_forecasts — vectorised, returns [unique_id, h1, h2, h3]
+migrate.py          Applies migrations/*.sql in order, tracks in schema_migrations
+ingest.py           M5 download → weekly_sales, calendar, prices, item_meta (raw, no features)
+build_features.py   Raw tables → features table (lags, rolling, price, calendar)
+backtest.py         Expanding-window backtest, reads/writes SQLite only
+smoke_test.py       Single-cycle sanity check with per-step timing
+app.py              Streamlit dashboard
+
+xai_forecast/
+  features.py       FEATURE_COLS list + constants (no data loading)
+  db.py             SQLite helpers — get_conn, insert_*, load_*, week_summary
+  train.py          train_model(df) → LGBMRegressor
+  forecast.py       make_forecasts(model, week_df, week) → [unique_id, h1]
   evaluate.py       evaluate_h1, flag_bad_weeks (rolling z-score)
   xai.py            shap_payloads, counterfactual_payloads, contrastive_payloads
 
-backtest.py         Orchestrator: expanding-window loop → writes db/forecasting.db
-app.py              Streamlit dashboard (Overview / Bad Week Drilldown / XAI Explorer)
+migrations/
+  001_raw_tables.sql      weekly_sales, calendar, prices, item_meta
+  002_features_table.sql  features (with indexes)
+  003_output_tables.sql   forecasts, evaluations, xai_results (with indexes)
 
-data/               M5 raw files — downloaded by datasetsforecast (gitignored)
+data/               M5 raw files (gitignored — downloaded by ingest.py)
 db/                 SQLite database (gitignored)
 ```
 
+## SQLite tables
+
+| Table | Written by | Purpose |
+|---|---|---|
+| `weekly_sales` | ingest.py | Raw weekly unit sales per SKU |
+| `calendar` | ingest.py | SNAP, event flags per week |
+| `prices` | ingest.py | Weekly avg sell price per SKU |
+| `item_meta` | ingest.py | dept_enc, cat_enc per SKU (static) |
+| `features` | build_features.py | Full feature matrix — what backtest reads |
+| `forecasts` | backtest.py | h=1 predictions per SKU per cutoff week |
+| `evaluations` | backtest.py | MAPE, MAE, bad-week flag per SKU per week |
+| `xai_results` | backtest.py | JSON payloads: shap / counterfactual / contrastive |
+
 ## Key design decisions
 
-**Data**: M5 store `CA_1`, ~3k SKUs, 5.5 years daily aggregated to weekly. Loaded via `datasetsforecast` (no Kaggle login needed).
+**Store:** CA_1 only (~3,049 SKUs). One global LightGBM model across all SKUs.
 
-**Features** (19 total): lag_{1,2,4,8,52}, rolling_{4,8,13}_mean, rolling_4_std, week_of_year, month, year, snap, has_event, event_type_enc, sell_price, price_change_pct, dept_enc, cat_enc. All defined in `FEATURE_COLS` in `features.py`.
+**Training window:** Fixed 3-year (156-week) sliding window. Retrain every 4 weeks (`RETRAIN_FREQ`).
 
-**Backtest**: Retrains every 4 weeks (`RETRAIN_FREQ`), 52-week warmup. Uses actual lags for h=2/h=3 (retrospective assumption — valid for diagnosis purposes, would be leaky in production).
+**Leakage controls (in build_features.py):**
+- Lag features: `shift(n)` — lag_1 at week t = sales[t-1]
+- Rolling features: `shift(1).rolling(w)` — excludes current week
+- `sell_price` NaN: `ffill` within item (last known price, not global median)
+- `price_change_pct`: computed after ffill, `fill_method=None`
 
-**Bad week detection**: A week is flagged when its avg-MAPE z-score (8-week rolling window) ≥ 1.5. Threshold in `evaluate.py:flag_bad_weeks`.
+**Bad week detection:** Week flagged when avg-MAPE z-score (8-week rolling window) ≥ 1.5.
 
-**XAI — three angles per bad week:**
-- `shap`: TreeSHAP waterfall for the h=1 prediction (top 5 features, stored as JSON)
-- `counterfactual`: perturb SNAP/event/price_change to zero; measure prediction delta — answers "how much did this feature inflate the forecast?"
-- `contrastive`: find a historical good week (same week-of-year, MAPE < 15%) for the same item; diff SHAP profiles — answers "what was structurally different that time?"
+**XAI (top 50 worst SKUs per bad week):**
+- `shap`: TreeSHAP waterfall — what drove the prediction
+- `counterfactual`: zero out SNAP/event/price-change → measure prediction delta
+- `contrastive`: compare SHAP profile vs a similar good week (same week-of-year, MAPE < 15%)
 
-**SQLite schema**: `forecasts`, `actuals`, `evaluations`, `xai_results` — all keyed by `(week_id, item_id)`. XAI payloads stored as JSON strings in `xai_results.payload`.
+**Adding a migration:** Add `00N_description.sql` to `migrations/`, run `migrate.py`. Never edit applied migrations.
 
 ## Stack
 
-- Python managed with `uv` (never `pip` or `venv`)
-- LightGBM + SHAP for model and explanations
-- SQLite (stdlib) for persistence
-- Streamlit + Plotly for the dashboard
+- Python + `uv` (never pip/venv)
+- LightGBM + SHAP
+- SQLite (stdlib) — WAL mode enabled
+- Streamlit + Plotly
