@@ -36,7 +36,7 @@ def load_raw_window(conn: sqlite3.Connection, week_start: str, week_end: str) ->
         SELECT ws.week, ws.unique_id, ws.y,
                c.snap, c.has_event, c.event_type_enc,
                p.sell_price,
-               m.dept_enc, m.cat_enc
+               m.dept_mean_sales, m.cat_mean_sales
         FROM weekly_sales ws
         LEFT JOIN calendar  c ON c.week      = ws.week
         LEFT JOIN prices    p ON p.week      = ws.week AND p.unique_id = ws.unique_id

@@ -30,7 +30,7 @@ def shap_payloads(
     if rows.empty:
         return []
 
-    X = rows[FEATURE_COLS].values
+    X = rows[FEATURE_COLS]
     sv = explainer.shap_values(X)
     base = float(explainer.expected_value)
     preds = model.predict(X).clip(min=0)
@@ -73,7 +73,7 @@ def counterfactual_payloads(
         return []
 
     X_orig = rows[FEATURE_COLS].copy()
-    preds_orig = model.predict(X_orig.values).clip(min=0)
+    preds_orig = model.predict(X_orig).clip(min=0)
 
     cf_preds: dict[str, np.ndarray] = {}
     for scenario, overrides in _CF_PERTURBATIONS:
@@ -81,7 +81,7 @@ def counterfactual_payloads(
         for col, val in overrides.items():
             if col in X_cf.columns:
                 X_cf[col] = val
-        cf_preds[scenario] = model.predict(X_cf.values).clip(min=0)
+        cf_preds[scenario] = model.predict(X_cf).clip(min=0)
 
     results = []
     for i, uid in enumerate(rows['unique_id']):

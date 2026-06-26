@@ -17,6 +17,6 @@ def make_forecasts(
     """
     if week_df.empty:
         return pd.DataFrame(columns=['unique_id', 'h1'])
-    X = week_df[FEATURE_COLS].fillna(0).values
+    X = week_df[FEATURE_COLS].fillna(0)
     preds = model.predict(X).clip(min=0)
     return pd.DataFrame({'unique_id': week_df['unique_id'].values, 'h1': preds})

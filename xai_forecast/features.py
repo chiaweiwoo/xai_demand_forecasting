@@ -17,10 +17,10 @@ FEATURE_COLS = [
     'week_of_year', 'month', 'year',
     'snap', 'has_event', 'event_type_enc',
     'sell_price', 'price_change_pct',
-    'dept_enc', 'cat_enc',
+    'dept_mean_sales', 'cat_mean_sales',
 ]
 
-# Extra weeks of history needed before training window to compute lag_52
+# Extra weeks fetched before training window so lag_52 is non-NaN for first training week
 HISTORY_BUFFER = 52
 
 
@@ -30,13 +30,13 @@ def compute_features(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute feature matrix from a raw joined DataFrame.
     raw_df columns: week, unique_id, y, snap, has_event, event_type_enc,
-                    sell_price, dept_enc, cat_enc
+                    sell_price, dept_mean_sales, cat_mean_sales
 
     Leakage guarantees:
-    - lag_*: shift(n) — lag_1 at week t uses sales[t-1]
+    - lag_*: shift(n) per SKU — lag_1 at week t uses sales[t-1]
     - rolling_*: shift(1).rolling(w) — excludes current week
-    - sell_price NaN: ffill within item (last known price, not global stats)
-    - price_change_pct: computed after ffill, fill_method=None
+    - sell_price NaN: ffill within item (last known price)
+    - dept_mean_sales / cat_mean_sales: static precomputed priors, no temporal component
     """
     warnings.filterwarnings('ignore', category=FutureWarning)
     warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -49,7 +49,7 @@ def compute_features(raw_df: pd.DataFrame) -> pd.DataFrame:
             lambda x: x.shift(lag)
         )
 
-    # Rolling features (shift first — no current-week leakage)
+    # Rolling features (shift first — excludes current week)
     for w in ROLL_WINDOWS:
         df[f'rolling_{w}_mean'] = df.groupby('unique_id')['y'].transform(
             lambda x: x.shift(1).rolling(w, min_periods=max(1, w // 2)).mean()
@@ -59,14 +59,14 @@ def compute_features(raw_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # Calendar
-    df['week_of_year'] = pd.to_datetime(df['week']).dt.isocalendar().week.astype(int)
-    df['month']        = pd.to_datetime(df['week']).dt.month
-    df['year']         = pd.to_datetime(df['week']).dt.year
-    df['snap']         = df['snap'].fillna(0).astype(int)
-    df['has_event']    = df['has_event'].fillna(0).astype(int)
+    df['week_of_year']   = pd.to_datetime(df['week']).dt.isocalendar().week.astype(int)
+    df['month']          = pd.to_datetime(df['week']).dt.month
+    df['year']           = pd.to_datetime(df['week']).dt.year
+    df['snap']           = df['snap'].fillna(0).astype(int)
+    df['has_event']      = df['has_event'].fillna(0).astype(int)
     df['event_type_enc'] = df['event_type_enc'].fillna(0).astype(int)
 
-    # Price — ffill within item (last known, no future data)
+    # Price — ffill within item (last known price, no future data)
     df['sell_price'] = df.groupby('unique_id')['sell_price'].transform(
         lambda x: x.ffill().bfill()
     )
@@ -74,7 +74,8 @@ def compute_features(raw_df: pd.DataFrame) -> pd.DataFrame:
         lambda x: x.pct_change(fill_method=None).fillna(0).clip(-1, 2)
     )
 
-    df['dept_enc'] = df['dept_enc'].fillna(0).astype(int)
-    df['cat_enc']  = df['cat_enc'].fillna(0).astype(int)
+    # dept_mean_sales / cat_mean_sales — static priors, pass through as-is
+    df['dept_mean_sales'] = df['dept_mean_sales'].fillna(0)
+    df['cat_mean_sales']  = df['cat_mean_sales'].fillna(0)
 
     return df

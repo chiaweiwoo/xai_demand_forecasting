@@ -1,8 +1,9 @@
 """
-One-time raw data ingestion. Run once before build_features.py.
+One-time raw data ingestion from M5 CSVs into SQLite.
+Reads directly from data/m5/datasets/ — no datasetsforecast parsing.
 
-Loads M5 via datasetsforecast, stores raw weekly data into SQLite.
-No feature engineering here — fast and simple.
+Week key = Saturday date string (Walmart fiscal week start), derived from wm_yr_wk.
+All tables join on `week` (str) and `unique_id` (str).
 
 Usage:
     uv run python ingest.py
@@ -11,96 +12,126 @@ Usage:
 import pandas as pd
 from xai_forecast.db import get_conn, insert_raw
 
-STORE = 'CA_1'
-SNAP_STATE = 'CA'
-DB_PATH = 'db/forecasting.db'
+DATA_DIR  = 'data/m5/datasets'
+STORE     = 'CA_1'
+SNAP_COL  = 'snap_CA'
+DB_PATH   = 'db/forecasting.db'
+
 EVENT_TYPE_MAP = {'National': 1, 'Cultural': 2, 'Religious': 3, 'Sporting': 4}
 
 
 def main() -> None:
-    print('Loading M5 from datasetsforecast...')
-    from datasetsforecast.m5 import M5
-    Y_df, X_df, S_df = M5.load(directory='data')
-    print(f'  Raw: {len(Y_df):,} daily rows loaded')
+    # ── Calendar: build d_N -> wm_yr_wk -> week_start mapping ───────────────
+    print('Reading calendar...')
+    cal = pd.read_csv(f'{DATA_DIR}/calendar.csv', parse_dates=['date'])
+    cal = cal.sort_values('date').reset_index(drop=True)
 
-    # Filter to one store
-    mask = Y_df['unique_id'].str.endswith(f'_{STORE}')
-    Y = Y_df[mask].copy()
-    Y['ds'] = pd.to_datetime(Y['ds'])
-    Y['week'] = Y['ds'].dt.to_period('W').dt.start_time.dt.strftime('%Y-%m-%d')
+    # d_N index: d_1 = first row (2011-01-29, Saturday)
+    cal['d'] = 'd_' + (cal.index + 1).astype(str)
 
-    # weekly_sales: sum daily → weekly
+    # week_start = earliest date in each fiscal week (the Saturday)
+    week_starts = cal.groupby('wm_yr_wk')['date'].min().rename('week_start')
+    cal = cal.merge(week_starts, on='wm_yr_wk')
+    cal['week'] = cal['week_start'].dt.strftime('%Y-%m-%d')
+
+    # d -> week lookup for sales aggregation
+    d_to_week = cal.set_index('d')['week'].to_dict()
+
+    # Calendar table: one row per fiscal week
+    calendar = (
+        cal.groupby('week').agg(
+            snap       = (SNAP_COL,       'max'),
+            has_event  = ('event_type_1', lambda x: int(x.notna().any())),
+            event_type_enc = ('event_type_1',
+                lambda x: EVENT_TYPE_MAP.get(x.dropna().iloc[0], 0) if x.notna().any() else 0),
+        )
+        .reset_index()
+    )
+    print(f'  calendar: {len(calendar)} weeks | '
+          f'{calendar["has_event"].sum()} event weeks | {calendar["snap"].sum()} SNAP weeks')
+
+    # ── Sales: melt wide -> long, aggregate daily -> weekly ─────────────────
+    print('Reading sales...')
+    sales_raw = pd.read_csv(f'{DATA_DIR}/sales_train_evaluation.csv')
+    store_df  = sales_raw[sales_raw['store_id'] == STORE].copy()
+    day_cols  = [c for c in store_df.columns if c.startswith('d_')]
+
+    print(f'  {len(store_df)} SKUs x {len(day_cols)} days -> melting...')
+    long = store_df.melt(
+        id_vars=['item_id', 'dept_id', 'cat_id'],
+        value_vars=day_cols,
+        var_name='d', value_name='y',
+    )
+    long['week']      = long['d'].map(d_to_week)
+    long['unique_id'] = long['item_id'] + '_' + STORE
+
     weekly_sales = (
-        Y.groupby(['unique_id', 'week'])['y']
+        long.groupby(['unique_id', 'week'], observed=True)['y']
         .sum().reset_index()
     )
-    print(f'  weekly_sales: {len(weekly_sales):,} rows | {weekly_sales["unique_id"].nunique()} items | {weekly_sales["week"].nunique()} weeks')
+    print(f'  weekly_sales: {len(weekly_sales):,} rows | '
+          f'{weekly_sales["unique_id"].nunique()} items | {weekly_sales["week"].nunique()} weeks')
 
-    # calendar: one row per week (snap + events — store-level, not item-level)
-    snap_col = f'snap_{SNAP_STATE}'
-    X = X_df[X_df['unique_id'].str.endswith(f'_{STORE}')].copy()
-    X['ds'] = pd.to_datetime(X['ds'])
-    X['week'] = X['ds'].dt.to_period('W').dt.start_time.dt.strftime('%Y-%m-%d')
+    # ── Prices: wm_yr_wk -> week string, then weekly mean ───────────────────
+    print('Reading prices...')
+    wk_map    = cal[['wm_yr_wk', 'week']].drop_duplicates()
+    prices_raw = pd.read_csv(f'{DATA_DIR}/sell_prices.csv')
+    prices_raw = prices_raw[prices_raw['store_id'] == STORE].copy()
+    prices_raw = prices_raw.merge(wk_map, on='wm_yr_wk')
+    prices_raw['unique_id'] = prices_raw['item_id'] + '_' + STORE
 
-    cal_agg: dict = {}
-    if snap_col in X.columns:
-        cal_agg[snap_col] = 'max'
-    if 'event_type_1' in X.columns:
-        cal_agg['event_type_1'] = lambda s: s.dropna().iloc[0] if s.notna().any() else None
+    prices = (
+        prices_raw.groupby(['unique_id', 'week'], observed=True)['sell_price']
+        .mean().reset_index()
+    )
+    print(f'  prices: {len(prices):,} rows | null prices: {prices["sell_price"].isna().sum()}')
 
-    # Calendar is store-level so deduplicate across items
-    X_week = X.drop_duplicates('week').set_index('week')
-    calendar_rows = []
-    for week in weekly_sales['week'].unique():
-        row = {'week': week, 'snap': 0, 'has_event': 0, 'event_type_enc': 0}
-        if week in X_week.index:
-            r = X_week.loc[week]
-            row['snap'] = int(r[snap_col]) if snap_col in X_week.columns and pd.notna(r.get(snap_col)) else 0
-            et = r.get('event_type_1') if 'event_type_1' in X_week.columns else None
-            row['has_event'] = 1 if pd.notna(et) else 0
-            row['event_type_enc'] = EVENT_TYPE_MAP.get(et, 0) if pd.notna(et) else 0
-        calendar_rows.append(row)
-    calendar = pd.DataFrame(calendar_rows)
-    print(f'  calendar: {len(calendar)} weeks | {calendar["has_event"].sum()} event weeks | {calendar["snap"].sum()} SNAP weeks')
+    # ── Item meta: dept/cat target encoding (mean weekly sales) ─────────────
+    print('Building item meta...')
+    meta = long[['unique_id', 'item_id', 'dept_id', 'cat_id']].drop_duplicates('unique_id')
 
-    # prices: item × week
-    if 'sell_price' in X_df.columns:
-        Xp = X_df[X_df['unique_id'].str.endswith(f'_{STORE}')].copy()
-        Xp['ds'] = pd.to_datetime(Xp['ds'])
-        Xp['week'] = Xp['ds'].dt.to_period('W').dt.start_time.dt.strftime('%Y-%m-%d')
-        prices = (
-            Xp.groupby(['unique_id', 'week'])['sell_price']
-            .mean().reset_index()
-        )
-    else:
-        prices = pd.DataFrame(columns=['unique_id', 'week', 'sell_price'])
-    print(f'  prices: {len(prices):,} rows')
+    # Mean weekly sales per dept and cat — static prior, no temporal leakage
+    sku_weekly_mean = (
+        long.groupby(['unique_id', 'week'], observed=True)['y'].sum()
+        .groupby('unique_id').mean()
+        .rename('sku_mean')
+    )
+    dept_mean = (
+        sku_weekly_mean.reset_index()
+        .merge(meta[['unique_id', 'dept_id']], on='unique_id')
+        .groupby('dept_id')['sku_mean'].mean()
+        .rename('dept_mean_sales')
+    )
+    cat_mean = (
+        sku_weekly_mean.reset_index()
+        .merge(meta[['unique_id', 'cat_id']], on='unique_id')
+        .groupby('cat_id')['sku_mean'].mean()
+        .rename('cat_mean_sales')
+    )
 
-    # item_meta: static per item
-    if S_df is not None and len(S_df) > 0:
-        meta = S_df[S_df['unique_id'].str.endswith(f'_{STORE}')].copy()
-        meta['dept_enc'] = meta['dept_id'].astype('category').cat.codes.astype(int) if 'dept_id' in meta.columns else 0
-        meta['cat_enc']  = meta['cat_id'].astype('category').cat.codes.astype(int)  if 'cat_id'  in meta.columns else 0
-        item_meta = meta[['unique_id', 'dept_enc', 'cat_enc']]
-    else:
-        item_meta = pd.DataFrame({'unique_id': weekly_sales['unique_id'].unique(), 'dept_enc': 0, 'cat_enc': 0})
+    meta = (
+        meta
+        .merge(dept_mean, on='dept_id')
+        .merge(cat_mean,  on='cat_id')
+    )
+    item_meta = meta[['unique_id', 'dept_id', 'cat_id', 'dept_mean_sales', 'cat_mean_sales']]
     print(f'  item_meta: {len(item_meta)} items')
+    print(f'  dept_mean_sales range: {item_meta["dept_mean_sales"].min():.2f} - {item_meta["dept_mean_sales"].max():.2f}')
+    print(f'  cat_mean_sales range:  {item_meta["cat_mean_sales"].min():.2f} - {item_meta["cat_mean_sales"].max():.2f}')
 
+    # ── Write to SQLite ──────────────────────────────────────────────────────
     print('\nWriting to SQLite...')
     conn = get_conn(DB_PATH)
 
-    # Guard: skip if already ingested
     cur = conn.execute('SELECT COUNT(*) FROM weekly_sales')
     if cur.fetchone()[0] > 0:
-        print('weekly_sales already populated — skipping. Delete db/forecasting.db to re-ingest.')
+        print('weekly_sales already populated — delete db/forecasting.db to re-ingest.')
         conn.close()
         return
 
     insert_raw(conn, weekly_sales, calendar, prices, item_meta)
     conn.close()
-
-    n = len(weekly_sales)
-    print(f'Done. {n:,} rows written to {DB_PATH}')
+    print(f'Done. {len(weekly_sales):,} rows written to {DB_PATH}')
 
 
 if __name__ == '__main__':
