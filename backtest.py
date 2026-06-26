@@ -57,6 +57,10 @@ def main() -> None:
     backtest_weeks = weeks[TRAIN_WINDOW:-1]
     print(f'Backtest: {len(backtest_weeks)} weeks | ~{len(backtest_weeks) // RETRAIN_FREQ} retrains\n')
 
+    # Clean slate — ensures no orphan rows from previous or partial runs
+    conn.executescript('DELETE FROM forecasts; DELETE FROM evaluations; DELETE FROM xai_results;')
+    conn.commit()
+
     model = None
     all_evals: list[pd.DataFrame] = []
 

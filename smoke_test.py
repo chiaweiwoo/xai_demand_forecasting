@@ -26,7 +26,8 @@ TRAIN_WINDOW  = 156
 WEEKS_TO_TEST = 5
 CONCURRENCY   = 5
 TOP_N         = 5
-DB_PATH       = 'db/forecasting.db'
+SOURCE_DB     = 'db/forecasting.db'   # raw data + feature store (read-only)
+SMOKE_DB      = 'db/smoke.db'         # throwaway output — never read by dashboard
 
 _print_lock = threading.Lock()
 
@@ -46,8 +47,8 @@ def fail(msg: str) -> None:
 def run_week(forecast_week: str, weeks: list, model, explainer) -> dict:
     t0 = time.perf_counter()
 
-    # Each thread gets its own SQLite connection (WAL mode allows concurrent reads)
-    conn    = get_conn(DB_PATH)
+    # Each thread gets its own connection to the source DB (WAL allows concurrent reads)
+    conn    = get_conn(SOURCE_DB)
     week_df = load_features_week(conn, forecast_week)
     conn.close()
 
@@ -90,27 +91,23 @@ def main() -> None:
 
     # ── Setup ─────────────────────────────────────────────────────
     t = time.perf_counter()
-    conn  = get_conn(DB_PATH)
+    conn  = get_conn(SOURCE_DB)
     weeks = get_all_weeks(conn)
+    n_feat = conn.execute('SELECT COUNT(*) FROM features').fetchone()[0]
     conn.close()
 
     if not weeks:
         fail('No data -- run: uv run python ingest.py')
     if len(weeks) <= TRAIN_WINDOW + WEEKS_TO_TEST:
         fail(f'Not enough weeks: need {TRAIN_WINDOW + WEEKS_TO_TEST}, have {len(weeks)}')
+    if n_feat == 0:
+        fail('Feature store empty -- run: uv run python build_features.py')
     print(f'\n[STEP] Setup  ({time.perf_counter()-t:.2f}s)')
     print(f'  {len(weeks)} weeks in DB ({weeks[0]} -> {weeks[-1]})')
 
-    # ── Check feature store ────────────────────────────────────────
-    conn = get_conn(DB_PATH)
-    n_feat = conn.execute('SELECT COUNT(*) FROM features').fetchone()[0]
-    conn.close()
-    if n_feat == 0:
-        fail('Feature store empty -- run: uv run python build_features.py')
-
     # ── Train (single model, weeks[TRAIN_WINDOW] cutoff) ──────────
     t = time.perf_counter()
-    conn         = get_conn(DB_PATH)
+    conn         = get_conn(SOURCE_DB)
     cutoff       = weeks[TRAIN_WINDOW]
     window_start = weeks[0]
     train_df     = load_features_window(conn, window_start, cutoff).dropna(subset=FEATURE_COLS)
@@ -136,7 +133,7 @@ def main() -> None:
 
     print(f'\n[STEP] Parallel forecast ({WEEKS_TO_TEST} weeks, concurrency={CONCURRENCY})')
     print(f'  Weeks: {forecast_weeks}')
-    print(f'  Sequential estimate: ~{WEEKS_TO_TEST * 36:.0f}s  |  parallel target: ~36s\n')
+    print(f'  Sequential estimate: ~{WEEKS_TO_TEST:.0f}s  |  parallel target: ~1s\n')
 
     t_parallel = time.perf_counter()
     results = {}
@@ -173,9 +170,9 @@ def main() -> None:
     if not all_ok:
         fail('One or more weeks failed validation')
 
-    # ── Write to SQLite (serial — avoid write contention) ──────────
+    # ── Write to throwaway smoke DB (never touches forecasting.db) ──
     t = time.perf_counter()
-    conn = get_conn(DB_PATH)
+    conn = get_conn(SMOKE_DB)
     for r in results.values():
         fw = r['forecast_week']
         insert_forecasts(conn, [
