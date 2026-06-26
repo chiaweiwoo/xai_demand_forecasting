@@ -4,6 +4,8 @@ import lightgbm as lgb
 from xai_forecast.features import FEATURE_COLS
 
 _LGB_PARAMS = {
+    'objective': 'tweedie',   # handles zero-heavy count data (64% zero-sale days)
+    'tweedie_variance_power': 1.5,
     'n_estimators': 300,
     'learning_rate': 0.05,
     'num_leaves': 63,

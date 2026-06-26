@@ -5,7 +5,7 @@ Requires ingest.py to have run first. Schema is created automatically by get_con
 Usage:
     uv run python smoke_test.py
 
-Expected: ~15-30 sec (SQL + feature compute + train + XAI).
+Expected: ~30-60 sec (SQL + feature compute + train + XAI).
 """
 
 import sys
@@ -36,11 +36,11 @@ def step(label: str) -> None:
 
 
 def ok(label: str, detail: str = '') -> None:
-    print(f'  [OK]   {label}' + (f' — {detail}' if detail else '') + f'  ({time.perf_counter()-_t0:.2f}s)')
+    print(f'  [OK]   {label}' + (f' -- {detail}' if detail else '') + f'  ({time.perf_counter()-_t0:.2f}s)')
 
 
 def fail(label: str, detail: str = '') -> None:
-    print(f'  [FAIL] {label}' + (f' — {detail}' if detail else '') + f'  ({time.perf_counter()-_t0:.2f}s)')
+    print(f'  [FAIL] {label}' + (f' -- {detail}' if detail else '') + f'  ({time.perf_counter()-_t0:.2f}s)')
     sys.exit(1)
 
 
@@ -58,14 +58,13 @@ def main() -> None:
     conn  = get_conn(DB_PATH)
     weeks = get_all_weeks(conn)
     if not weeks:
-        fail('No data — run: uv run python ingest.py')
+        fail('No data -- run: uv run python ingest.py')
     check('Weeks in DB', len(weeks) > TRAIN_WINDOW, f'{len(weeks)} weeks')
 
-    step(f'Load raw window + compute features (train window)')
+    step('Load raw window + compute features (train window)')
     cutoff       = weeks[TRAIN_WINDOW]
+    forecast_week = weeks[TRAIN_WINDOW + 1]
     window_start = weeks[0]
-    # Need buffer before window_start so lag_52 is populated for first training week.
-    # At step=TRAIN_WINDOW, step - TRAIN_WINDOW - HISTORY_BUFFER = -52, clamped to 0.
     buffer_start = weeks[max(0, TRAIN_WINDOW - TRAIN_WINDOW - HISTORY_BUFFER)]  # weeks[0]
     raw_df       = load_raw_window(conn, buffer_start, cutoff)
     features_df  = compute_features(raw_df)
@@ -80,11 +79,10 @@ def main() -> None:
     check('Feature importances', len(model.feature_importances_) == len(FEATURE_COLS))
 
     step('Load + compute features for forecast week')
-    forecast_week = weeks[TRAIN_WINDOW + 1]
-    buf_start     = weeks[max(0, TRAIN_WINDOW + 1 - HISTORY_BUFFER)]
-    raw_fcst      = load_raw_window(conn, buf_start, forecast_week)
-    feat_fcst     = compute_features(raw_fcst)
-    week_df       = feat_fcst[feat_fcst['week'] == forecast_week]
+    buf_start = weeks[max(0, TRAIN_WINDOW + 1 - HISTORY_BUFFER)]
+    raw_fcst  = load_raw_window(conn, buf_start, forecast_week)
+    feat_fcst = compute_features(raw_fcst)
+    week_df   = feat_fcst[feat_fcst['week'] == forecast_week]
     check('Forecast week rows', len(week_df) > 0, f'{len(week_df)} SKUs | week={forecast_week}')
 
     step('Forecast h=1')
@@ -95,7 +93,7 @@ def main() -> None:
 
     step('Evaluate h=1 vs actuals')
     eval_df = evaluate_h1(fcst_df, week_df[['unique_id', 'y']])
-    eval_df['cutoff_week'] = cutoff
+    eval_df['forecast_week'] = forecast_week
     check('Eval rows', len(eval_df) > 0, f'{len(eval_df)} rows')
     check('MAPE non-negative', (eval_df['mape'] >= 0).all())
     ok(f'Avg MAPE={eval_df["mape"].mean():.1f}%  median={eval_df["mape"].median():.1f}%')
@@ -114,19 +112,26 @@ def main() -> None:
 
     step(f'Contrastive for top {TOP_N} items')
     ct_rows = contrastive_payloads(explainer, week_df, forecast_week, top_items, eval_df, conn)
-    check('Contrastive ran', True, f'{len(ct_rows)} rows (0 expected — no prior eval history)')
+    check('Contrastive ran', True, f'{len(ct_rows)} rows (0 expected -- no prior eval history)')
 
-    step('SQLite write + read back')
+    step('SQLite write + read back (keyed on forecast_week)')
     insert_forecasts(conn, [
-        {'week_id': cutoff, 'item_id': r['unique_id'], 'h1': r['h1'], 'trained_at': 'smoke-test'}
+        {'week_id': forecast_week, 'item_id': r['unique_id'], 'h1': r['h1'], 'trained_at': 'smoke-test'}
         for r in fcst_df.to_dict('records')
     ])
     insert_evaluations(conn, [
-        {'week_id': cutoff, 'item_id': r['unique_id'],
+        {'week_id': forecast_week, 'item_id': r['unique_id'],
          'h1_mape': r['mape'], 'h1_mae': r['mae'], 'is_bad_week': 1, 'mape_zscore': 2.0}
         for r in eval_df.to_dict('records')
     ])
     insert_xai(conn, shap_rows + cf_rows)
+
+    # Cross-join check: xai_results and evaluations share the same week_id
+    xai_weeks = set(r['week_id'] for r in (shap_rows + cf_rows))
+    eval_weeks = {forecast_week}
+    check('XAI and eval week keys match', xai_weeks == eval_weeks,
+          f'xai={xai_weeks}  eval={eval_weeks}')
+
     summary = week_summary(conn)
     conn.close()
     check('Summary readable', len(summary) == 1,
