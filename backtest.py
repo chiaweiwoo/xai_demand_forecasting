@@ -1,20 +1,23 @@
 """
-Full backtesting simulation. Run ingest.py and build_features.py first.
+Sliding-window backtest: forecast + evaluate only.
 
-Usage:
-    uv run python backtest.py
+Run ingest.py and build_features.py first.
 
-At each iteration: load precomputed features from the feature store -> train -> forecast.
-Each retrain checkpoint is kept in memory so XAI explanations come from the same model
-that produced each week's forecast (at 4-week retrain granularity).
+Outputs:
+  db/forecasting.db       → forecasts, evaluations tables
+  models/checkpoint_*.lgbm → one LightGBM checkpoint per retrain cutoff
+  db/week_to_cutoff.json  → maps forecast_week → retrain cutoff (needed by run_xai.py)
 
-Week key convention: all tables (forecasts, evaluations, xai_results) are keyed on
-forecast_week -- the week the failure was observed, not the training cutoff. This is
-the natural "week X" a leader would point at.
+Next steps:
+  uv run python run_xai.py           # SHAP / counterfactual / contrastive
+  uv run python generate_narratives.py  # LLM narratives
+  uv run python data_quality.py
+  uv run streamlit run app.py
 """
 
 import json
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import lightgbm as lgb
@@ -29,19 +32,17 @@ except ImportError:
 from xai_forecast.db import (
     get_conn, get_all_weeks,
     load_features_window, load_features_week,
-    insert_forecasts, insert_evaluations, insert_xai, insert_narrative,
-    load_all_shap_payloads,
+    insert_forecasts, insert_evaluations,
 )
 from xai_forecast.features import FEATURE_COLS
 from xai_forecast.train import train_model
 from xai_forecast.forecast import make_forecasts
 from xai_forecast.evaluate import evaluate_h1, flag_bad_weeks
-from xai_forecast.xai import make_explainer, shap_payloads, counterfactual_payloads, contrastive_payloads
 
 TRAIN_WINDOW = 156   # 3 years
 RETRAIN_FREQ = 4
-TOP_N_XAI    = 50
 DB_PATH      = 'db/forecasting.db'
+MODELS_DIR   = Path('models')
 
 
 def main() -> None:
@@ -59,25 +60,22 @@ def main() -> None:
         return
 
     print(f'{len(weeks)} weeks ({weeks[0]} -> {weeks[-1]})')
-    # Exclude weeks[-1] — the M5 eval file ends mid-week (only 2 days), making it a partial
-    # week with artificially low sales. Forecasting it produces spurious bad-week flags.
+    # Exclude weeks[-2:] — M5 eval file ends mid-week; last two weeks produce spurious spikes.
     backtest_weeks = weeks[TRAIN_WINDOW:-2]
     print(f'Backtest: {len(backtest_weeks)} weeks | ~{len(backtest_weeks) // RETRAIN_FREQ} retrains\n')
 
-    # Clean slate — ensures no orphan rows from previous or partial runs
-    conn.executescript(
-        'DELETE FROM forecasts; DELETE FROM evaluations; DELETE FROM xai_results; DELETE FROM narratives;'
-    )
+    # Clean slate for forecast/evaluation tables only.
+    # xai_results and narratives are managed by run_xai.py / generate_narratives.py.
+    conn.executescript('DELETE FROM forecasts; DELETE FROM evaluations;')
     conn.commit()
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     model: lgb.LGBMRegressor | None = None
     all_evals: list[pd.DataFrame] = []
-    # Per-checkpoint model store: retrain_cutoff → model
-    # Allows XAI to use the exact model that produced each week's forecast.
-    all_models: dict[str, lgb.LGBMRegressor] = {}
-    week_to_cutoff: dict[str, str] = {}  # forecast_week → retrain cutoff used
+    week_to_cutoff: dict[str, str] = {}
     last_retrain_cutoff: str | None = None
-    n_nan_imputed = 0  # pre-launch SKUs forecasted from all-zero features
+    n_nan_imputed = 0
 
     for i, cutoff in enumerate(tqdm(backtest_weeks, desc='Backtesting')):
         step = TRAIN_WINDOW + i
@@ -88,18 +86,14 @@ def main() -> None:
             window_start = weeks[step - TRAIN_WINDOW]
             train_df     = load_features_window(conn, window_start, cutoff).dropna(subset=FEATURE_COLS)
             model        = train_model(train_df)
-            all_models[last_retrain_cutoff] = model
+            model.booster_.save_model(str(MODELS_DIR / f'checkpoint_{last_retrain_cutoff}.lgbm'))
 
         week_to_cutoff[forecast_week] = last_retrain_cutoff
+
         week_df = load_features_week(conn, forecast_week)
+        n_nan_imputed += int((week_df[FEATURE_COLS].isnull().all(axis=1)).sum())
 
-        # Count pre-launch SKUs (all lag features NaN → imputed to 0 by make_forecasts)
-        n_nan_rows = int((week_df[FEATURE_COLS].isnull().all(axis=1)).sum())
-        n_nan_imputed += n_nan_rows
-
-        preds     = make_forecasts(model, week_df, forecast_week)
-
-        # Store under forecast_week -- the week the failure was observed
+        preds = make_forecasts(model, week_df, forecast_week)
         insert_forecasts(conn, [
             {'week_id': forecast_week, 'item_id': r['unique_id'],
              'h1': r['h1'], 'trained_at': datetime.utcnow().isoformat()}
@@ -112,8 +106,7 @@ def main() -> None:
         all_evals.append(eval_df)
 
     if n_nan_imputed > 0:
-        print(f'\n  Note: {n_nan_imputed:,} pre-launch SKU-week rows had all-NaN features → '
-              f'imputed to 0 by make_forecasts. These are scored against actual if y>0.')
+        print(f'\n  Note: {n_nan_imputed:,} pre-launch SKU-week rows had all-NaN features → imputed to 0.')
 
     print('\nFlagging bad weeks (WMAPE z-score, prior-weeks-only baseline)...')
     all_evals_df = pd.concat(all_evals, ignore_index=True)
@@ -132,103 +125,13 @@ def main() -> None:
     ])
     print(f'  {len(bad_weeks)} bad weeks out of {len(backtest_weeks)}')
 
-    print('\nComputing XAI (per-retrain-checkpoint model)...')
-    # Use the model that actually produced each week's forecast (same 4-week retrain granularity).
-    # Explainers are cached by cutoff to avoid rebuilding per bad week.
-    explainers_cache: dict[str, object] = {}
-    # Accumulate XAI rows in memory for the narrative phase below.
-    xai_data_per_week: dict[str, dict] = {}
-
-    for forecast_week in tqdm(bad_weeks, desc='XAI'):
-        xai_cutoff = week_to_cutoff.get(forecast_week)
-        if xai_cutoff is None or xai_cutoff not in all_models:
-            continue
-
-        xai_model = all_models[xai_cutoff]
-        if xai_cutoff not in explainers_cache:
-            explainers_cache[xai_cutoff] = make_explainer(xai_model)
-        xai_explainer = explainers_cache[xai_cutoff]
-
-        week_df    = load_features_week(conn, forecast_week)
-        week_evals = all_evals_df[all_evals_df['forecast_week'] == forecast_week]
-        top_items  = week_evals.nlargest(TOP_N_XAI, 'mape')['unique_id'].tolist()
-        actual_map = dict(zip(week_evals['unique_id'], week_evals['actual']))
-
-        shap_rows, shap_cache = shap_payloads(xai_explainer, xai_model, week_df, forecast_week, top_items, actual_map)
-        cf_rows   = counterfactual_payloads(xai_model, week_df, forecast_week, top_items, actual_map)
-        cont_rows = contrastive_payloads(xai_explainer, week_df, forecast_week, top_items, all_evals_df, conn, shap_cache)
-        xai_rows  = shap_rows + cf_rows + cont_rows
-        if xai_rows:
-            insert_xai(conn, xai_rows)
-
-        xai_data_per_week[forecast_week] = {
-            'shap_rows': shap_rows,
-            'cf_rows': cf_rows,
-            'cont_rows': cont_rows,
-            'top_items': top_items[:5],
-            'week_evals': week_evals,
-        }
-
-    # ── Narrative generation (requires DEEPSEEK_API_KEY in env) ──────────────
-    try:
-        from xai_forecast.narrate import (
-            DeepSeekNarrator,
-            WEEK_NARRATIVE_PROMPT, ITEM_NARRATIVE_PROMPT, EXECUTIVE_NARRATIVE_PROMPT,
-            build_week_dossier, build_item_dossier, build_executive_dossier,
-            compute_recurring_drivers,
-        )
-        narrator = DeepSeekNarrator()
-    except ImportError:
-        narrator = None  # type: ignore[assignment]
-
-    if narrator and narrator.available:
-        print(f'\nGenerating LLM narratives ({len(bad_weeks)} bad weeks + 1 executive)...')
-
-        for forecast_week in tqdm(bad_weeks, desc='Week narratives'):
-            data = xai_data_per_week.get(forecast_week, {})
-            shap_rows = data.get('shap_rows', [])
-            if not shap_rows:
-                continue
-
-            week_evals = data.get('week_evals', pd.DataFrame())
-            zscore = zscore_map.get(forecast_week)
-
-            week_doss = build_week_dossier(forecast_week, shap_rows, zscore, len(week_evals))
-            week_narr = narrator.generate(WEEK_NARRATIVE_PROMPT, week_doss)
-            if week_narr:
-                insert_narrative(conn, 'week', forecast_week, week_narr, narrator.model_id)
-
-            # Item-level narratives for the 5 worst SKUs per bad week
-            shap_by_item = {r['item_id']: r for r in shap_rows}
-            cf_by_item   = {r['item_id']: r for r in data.get('cf_rows', [])}
-            cont_by_item = {r['item_id']: r for r in data.get('cont_rows', [])}
-
-            for item_id in data.get('top_items', []):
-                shap_p = json.loads(shap_by_item[item_id]['payload']) if item_id in shap_by_item else None
-                cf_p   = json.loads(cf_by_item[item_id]['payload'])   if item_id in cf_by_item   else None
-                cont_p = json.loads(cont_by_item[item_id]['payload']) if item_id in cont_by_item else None
-                item_doss = build_item_dossier(forecast_week, item_id, shap_p, cf_p, cont_p)
-                item_narr = narrator.generate(ITEM_NARRATIVE_PROMPT, item_doss)
-                if item_narr:
-                    insert_narrative(conn, 'item', f'{forecast_week}::{item_id}', item_narr, narrator.model_id)
-
-        # Executive synthesis — aggregate recurring drivers from DB (same source as app.py)
-        drivers_list = compute_recurring_drivers(load_all_shap_payloads(conn))
-        exec_doss = build_executive_dossier(drivers_list, len(bad_weeks), len(backtest_weeks))
-        exec_narr = narrator.generate(EXECUTIVE_NARRATIVE_PROMPT, exec_doss)
-        if exec_narr:
-            insert_narrative(conn, 'executive', 'overall', exec_narr, narrator.model_id)
-
-        print('  Narratives saved to DB.')
-    else:
-        print('\nNo DEEPSEEK_API_KEY — narrative generation skipped.')
-        print('  Set DEEPSEEK_API_KEY in .env and re-run to generate narratives.')
+    # Save week→cutoff mapping so run_xai.py knows which checkpoint to use per forecast week.
+    cutoff_path = Path('db/week_to_cutoff.json')
+    cutoff_path.parent.mkdir(parents=True, exist_ok=True)
+    cutoff_path.write_text(json.dumps(week_to_cutoff))
+    print(f'  Saved {len(week_to_cutoff)} week→cutoff mappings → {cutoff_path}')
+    print(f'  Saved {len(list(MODELS_DIR.glob("*.lgbm")))} checkpoint models → {MODELS_DIR}/')
 
     conn.close()
     print(f'\nDone -> {DB_PATH}')
-    print('Next: uv run python data_quality.py')
-    print('Then: uv run streamlit run app.py')
-
-
-if __name__ == '__main__':
-    main()
+    print('Next: uv run python run_xai.py')

@@ -11,15 +11,19 @@ Core question: **"Leader sees the model performed badly at week X — why?"**
 ## Pipeline (run in order)
 
 ```bash
-uv run python ingest.py          # download M5, write raw tables (once only)
-uv run python build_features.py  # precompute all features → features table (rebuild whenever features.py changes)
-uv run python smoke_test.py      # sanity check before full run (staleness, contrastive, SHAP additivity)
-uv run python backtest.py        # full backtest (~120 weeks, ~30 retrains)
-uv run python data_quality.py    # post-backtest integrity checks (run before opening dashboard)
-uv run streamlit run app.py      # dashboard at localhost:8501
+uv run python ingest.py               # download M5, write raw tables (once only)
+uv run python build_features.py       # precompute all features → features table (rebuild whenever features.py changes)
+uv run python smoke_test.py           # sanity check before full run (staleness, contrastive, SHAP additivity)
+uv run python backtest.py             # forecast + evaluate → forecasts, evaluations; saves models/ + week_to_cutoff.json
+uv run python run_xai.py              # SHAP / counterfactual / contrastive → xai_results (re-runnable independently)
+uv run python generate_narratives.py  # LLM narratives → narratives table (re-runnable independently)
+uv run python data_quality.py         # post-run integrity checks (run before opening dashboard)
+uv run streamlit run app.py           # dashboard at localhost:8501
 uv run streamlit run code_review.py --server.port 7501  # code walkthrough app
-uv run pytest                    # 84 tests covering features, evaluation, XAI contracts, DB, end-to-end, narratives
+uv run pytest                         # 84 tests covering features, evaluation, XAI contracts, DB, end-to-end, narratives
 ```
+
+**Each stage is independently re-runnable.** If only LLM narratives need fixing, re-run `generate_narratives.py` alone — no need to redo ML or XAI. If XAI logic changes, re-run `run_xai.py` + `generate_narratives.py`. Only re-run `backtest.py` if model training or evaluation logic changes.
 
 **Critical invariant: rebuild the feature store whenever `features.py` changes.**
 `build_features.py` always clears and rebuilds — safe to re-run at any time. Forgetting this means backtest trains on stale/incorrect features silently. The smoke test catches this via a live diff before committing to a full run.
@@ -27,15 +31,17 @@ uv run pytest                    # 84 tests covering features, evaluation, XAI c
 ## Architecture
 
 ```
-ingest.py          M5 CSVs → weekly_sales, calendar, prices, item_meta (raw, no features)
-build_features.py  One-time: compute_features() on all 847k rows → features table
-backtest.py        Sliding-window train/forecast/evaluate/xai → output tables
-                   Keeps all retrain checkpoints in memory; XAI uses the exact model
-                   that produced each week's forecast (per-checkpoint, not one final model).
-smoke_test.py      Sanity check: feature staleness, parallel forecast, contrastive, SHAP additivity,
-                   + narrative API probe (one live DeepSeek call — fails loudly if config is wrong)
-data_quality.py    Post-backtest: referential integrity, h1>=0, pre-launch price leakage, etc.
-app.py             Streamlit dashboard (4 pages — see Dashboard section)
+ingest.py               M5 CSVs → weekly_sales, calendar, prices, item_meta (raw, no features)
+build_features.py       One-time: compute_features() on all 847k rows → features table
+backtest.py             Sliding-window train/forecast/evaluate → forecasts, evaluations tables
+                        Saves per-retrain LightGBM checkpoints to models/ dir and week_to_cutoff.json.
+run_xai.py              Loads saved checkpoints → SHAP / counterfactual / contrastive → xai_results
+                        Re-runnable independently of backtest. Uses exact per-checkpoint model per week.
+generate_narratives.py  Reads xai_results → LLM narratives → narratives table. Re-runnable independently.
+smoke_test.py           Sanity check: feature staleness, parallel forecast, contrastive, SHAP additivity,
+                        + narrative API probe (one live DeepSeek call — fails loudly if config is wrong)
+data_quality.py         Post-run: referential integrity, h1>=0, pre-launch price leakage, etc.
+app.py                  Streamlit dashboard (4 pages — see Dashboard section)
 
 xai_forecast/
   features.py      FEATURE_COLS, compute_features(raw_df) — single source of truth for all features
@@ -120,11 +126,11 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 
 **Week key convention:** All output tables (forecasts, evaluations, xai_results) are keyed on `forecast_week` — the week the error was observed. Not the training cutoff. This is the natural "week X" a leader would point at.
 
-**Idempotency:** `backtest.py` deletes all rows from forecasts/evaluations/xai_results/narratives at the start of each run. Re-running always produces a clean result with no orphan rows.
+**Idempotency:** Each script clears its own output tables at start. `backtest.py` clears forecasts + evaluations. `run_xai.py` clears xai_results. `generate_narratives.py` clears narratives. Re-running any stage produces a clean result with no orphan rows. Downstream stages are safe to re-run without re-running upstream (e.g. re-run `generate_narratives.py` alone to fix LLM issues).
 
 **Smoke test isolation:** `smoke_test.py` reads from `db/forecasting.db` (source DB, never written to) and writes all output to `db/smoke.db` (throwaway). Running the smoke test never contaminates dashboard data.
 
-**XAI model — per retrain checkpoint:** SHAP/counterfactual/contrastive for each bad week are computed using the exact retrain checkpoint that produced that week's forecast (at 4-week granularity). All ~30 checkpoints are kept in memory during the backtest run. Explainers are cached by checkpoint to avoid rebuilding per bad week. Contrastive compares both the bad week and its reference week under the **same model** (the bad week's checkpoint) to keep SHAP profiles in the same space.
+**XAI model — per retrain checkpoint:** SHAP/counterfactual/contrastive for each bad week are computed using the exact retrain checkpoint that produced that week's forecast (at 4-week granularity). `backtest.py` saves each checkpoint to `models/checkpoint_{cutoff}.lgbm` and the week→cutoff mapping to `db/week_to_cutoff.json`. `run_xai.py` loads these from disk so XAI can be re-run independently. Explainers are cached by checkpoint to avoid rebuilding per bad week. Contrastive compares both the bad week and its reference week under the **same model** (the bad week's checkpoint) to keep SHAP profiles in the same space.
 
 **XAI (top 50 worst SKUs per bad week):**
 - `shap`: TreeSHAP — top 5 drivers in log-margin space, plus `other_features_shap` (sum of remaining 14) so the waterfall reconciles: `base_value_log + Σ(top5) + other_features_shap ≈ log(prediction)`
