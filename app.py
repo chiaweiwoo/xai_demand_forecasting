@@ -24,6 +24,7 @@ from xai_forecast.db import (
     get_conn, week_summary, load_evaluations, load_xai, load_all_shap_payloads,
     load_narrative,
 )
+from xai_forecast.narrate import compute_recurring_drivers
 
 DB_PATH = 'db/forecasting.db'
 
@@ -88,26 +89,13 @@ def _week_shap_summary(week_id: str) -> pd.DataFrame:
 
 @st.cache_data
 def _recurring_drivers() -> pd.DataFrame:
-    """
-    Across all bad weeks, how often does each feature appear in the top-5 SHAP drivers?
-    Returns: feature → count (total appearances across all SHAP payloads).
-    """
+    """Feature appearance frequency across all bad-week SHAP payloads."""
     all_rows = _all_shap_payloads()
-    feature_counts: dict[str, int] = defaultdict(int)
-    total_payloads = 0
-    for r in all_rows:
-        p = json.loads(r['payload'])
-        total_payloads += 1
-        for f in p.get('top_features', []):
-            feature_counts[f['feature']] += 1
-    if not feature_counts:
+    drivers = compute_recurring_drivers(all_rows)
+    if not drivers:
         return pd.DataFrame()
-    df = pd.DataFrame([
-        {'feature': feat, 'count': cnt,
-         'pct_payloads': cnt / total_payloads * 100 if total_payloads else 0}
-        for feat, cnt in feature_counts.items()
-    ]).sort_values('count', ascending=False)
-    df['total_payloads'] = total_payloads
+    df = pd.DataFrame(drivers)
+    df['total_payloads'] = len(all_rows)
     return df
 
 

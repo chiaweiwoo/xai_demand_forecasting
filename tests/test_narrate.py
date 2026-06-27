@@ -20,6 +20,7 @@ from xai_forecast.narrate import (
     build_week_dossier,
     build_item_dossier,
     build_executive_dossier,
+    compute_recurring_drivers,
 )
 
 
@@ -156,6 +157,28 @@ def test_build_item_dossier_no_shap():
     dossier = build_item_dossier('2015-01-03', 'CA_1_001', None, None, None)
     assert dossier['features'] == []
     assert 'prediction' not in dossier
+
+
+# ── compute_recurring_drivers ────────────────────────────────────────────────
+
+def test_compute_recurring_drivers_counts_correctly():
+    rows = [_shap_row('2015-01-03', 'A'), _shap_row('2015-01-03', 'B')]
+    drivers = compute_recurring_drivers(rows)
+    # lag_1 appears in both rows → count 2
+    lag1 = next(d for d in drivers if d['feature'] == 'lag_1')
+    assert lag1['count'] == 2
+    assert lag1['pct_payloads'] == pytest.approx(100.0, abs=0.1)
+
+
+def test_compute_recurring_drivers_sorted_desc():
+    rows = [_shap_row('2015-01-03', 'A'), _shap_row('2015-01-03', 'B')]
+    drivers = compute_recurring_drivers(rows)
+    counts = [d['count'] for d in drivers]
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_compute_recurring_drivers_empty():
+    assert compute_recurring_drivers([]) == []
 
 
 # ── build_executive_dossier ───────────────────────────────────────────────────

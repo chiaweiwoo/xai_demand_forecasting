@@ -165,6 +165,31 @@ def build_item_dossier(
     return dossier
 
 
+def compute_recurring_drivers(shap_rows: list[dict]) -> list[dict]:
+    """
+    Count feature appearances across all SHAP payloads.
+    shap_rows: list of xai_results rows (each has a 'payload' JSON string).
+    Returns list[{feature, count, pct_payloads}] sorted by count desc.
+    Single source of truth — used by both backtest.py and app.py.
+    """
+    from collections import defaultdict
+    feature_counts: dict[str, int] = defaultdict(int)
+    total = len(shap_rows)
+    for row in shap_rows:
+        p = json.loads(row['payload']) if isinstance(row.get('payload'), str) else row.get('payload', {})
+        for f in p.get('top_features', []):
+            feature_counts[f['feature']] += 1
+    return sorted(
+        [
+            {'feature': feat, 'count': cnt,
+             'pct_payloads': round(cnt / total * 100, 1) if total else 0}
+            for feat, cnt in feature_counts.items()
+        ],
+        key=lambda x: x['count'],
+        reverse=True,
+    )
+
+
 def build_executive_dossier(
     drivers_list: list[dict],
     n_bad_weeks: int,

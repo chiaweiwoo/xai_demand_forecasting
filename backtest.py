@@ -14,7 +14,6 @@ the natural "week X" a leader would point at.
 """
 
 import json
-from collections import defaultdict
 from datetime import datetime
 
 import pandas as pd
@@ -31,6 +30,7 @@ from xai_forecast.db import (
     get_conn, get_all_weeks,
     load_features_window, load_features_week,
     insert_forecasts, insert_evaluations, insert_xai, insert_narrative,
+    load_all_shap_payloads,
 )
 from xai_forecast.features import FEATURE_COLS
 from xai_forecast.train import train_model
@@ -175,6 +175,7 @@ def main() -> None:
             DeepSeekNarrator,
             WEEK_NARRATIVE_PROMPT, ITEM_NARRATIVE_PROMPT, EXECUTIVE_NARRATIVE_PROMPT,
             build_week_dossier, build_item_dossier, build_executive_dossier,
+            compute_recurring_drivers,
         )
         narrator = DeepSeekNarrator()
     except ImportError:
@@ -211,24 +212,8 @@ def main() -> None:
                 if item_narr:
                     insert_narrative(conn, 'item', f'{forecast_week}::{item_id}', item_narr, narrator.model_id)
 
-        # Executive synthesis — aggregate recurring drivers across all bad weeks
-        feature_counts: dict[str, int] = defaultdict(int)
-        total_payloads = 0
-        for week_data in xai_data_per_week.values():
-            for row in week_data.get('shap_rows', []):
-                total_payloads += 1
-                p = json.loads(row['payload'])
-                for f in p.get('top_features', []):
-                    feature_counts[f['feature']] += 1
-
-        drivers_list = sorted(
-            [
-                {'feature': feat, 'count': cnt,
-                 'pct_payloads': round(cnt / total_payloads * 100, 1) if total_payloads else 0}
-                for feat, cnt in feature_counts.items()
-            ],
-            key=lambda x: x['count'], reverse=True,
-        )
+        # Executive synthesis — aggregate recurring drivers from DB (same source as app.py)
+        drivers_list = compute_recurring_drivers(load_all_shap_payloads(conn))
         exec_doss = build_executive_dossier(drivers_list, len(bad_weeks), len(backtest_weeks))
         exec_narr = narrator.generate(EXECUTIVE_NARRATIVE_PROMPT, exec_doss)
         if exec_narr:
