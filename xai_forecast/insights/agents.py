@@ -1,7 +1,8 @@
 """
 LLM steps for the insights pipeline.
 
-Three prompt constants (run /prompt-audit before editing):
+Four prompt constants (run /prompt-audit before editing):
+  PLANNER_PROMPT     -- Flash: decide which read-tools to call for this finding
   HYPOTHESIS_PROMPT  -- Flash: interpret one evidence pack, write grounded hypothesis
   CRITIC_PROMPT      -- Pro:   reject overclaim, forbid causal external claims, set confidence
   SYNTHESIS_PROMPT   -- Flash: combine accepted findings into two-perspective summary
@@ -20,6 +21,33 @@ from .schemas import CandidateFinding, Hypothesis, Critique
 # ── Prompt constants ──────────────────────────────────────────────────────────
 # NOTE: These are *_PROMPT constants. Per project rules, run /prompt-audit
 # before committing any edit to these strings.
+
+PLANNER_PROMPT = """\
+You are a data analyst planning evidence gathering for an XAI finding review in a retail
+demand forecasting system. Given a candidate finding, decide which read-tools to call to
+get the most useful context before writing a hypothesis.
+
+Available tools:
+  read_forecast_accuracy    -- global MAPE stats, bad/good week rates, worst week
+  read_bad_weeks            -- list of all bad weeks with z-scores and avg MAPE
+  read_xai_findings         -- SHAP/CF/contrastive payloads (sample from worst week)
+  read_demand_trajectory    -- actual sales + lag_1 + rolling mean + forecast for a SKU over time
+  read_external_signals     -- LA weather, CA gas price, consumer sentiment for a specific week
+  read_model_metadata       -- model config, feature importance from last checkpoint
+  read_recurring_drivers    -- feature appearance frequency across all bad-week SHAP payloads
+
+Rules:
+- Return valid JSON only — no markdown, no code fences:
+  {"tools": ["tool_name_1", "tool_name_2"],
+   "rationale": "<one sentence: why these tools for this finding type>"}
+- Choose 1-4 tools. Do not select tools whose output is redundant for this finding type.
+- For demand_cliff or contrastive_gap findings: include read_demand_trajectory.
+- For external_coincidence findings: always include read_external_signals.
+- For dominant_driver findings: always include read_recurring_drivers and read_model_metadata.
+- For over_forecast_bias findings: read_forecast_accuracy and read_recurring_drivers suffice.
+- For counterfactual_material findings: read_xai_findings and read_bad_weeks suffice.
+- Only include tools from the list above. Return exactly the tool names as shown.
+- Respond in English only."""
 
 HYPOTHESIS_PROMPT = """\
 You are a senior data scientist reviewing an XAI finding from a retail demand forecasting model.
@@ -107,7 +135,41 @@ Rules:
   (2) DS summary mentions specific features, (3) business summary has no model jargon."""
 
 
+_VALID_TOOLS = {
+    'read_forecast_accuracy',
+    'read_bad_weeks',
+    'read_xai_findings',
+    'read_demand_trajectory',
+    'read_external_signals',
+    'read_model_metadata',
+    'read_recurring_drivers',
+}
+
+
 # ── Agent step functions ──────────────────────────────────────────────────────
+
+def run_planner(
+    client: DeepSeekClient,
+    finding: CandidateFinding,
+) -> list[str]:
+    """Flash: decide which read-tools to call for this finding. Returns a validated tool list."""
+    payload = {
+        'finding_type': finding.finding_type,
+        'score': finding.score,
+        'summary': finding.summary,
+        'evidence_keys_available': list(finding.evidence.keys()),
+    }
+    result = client.call_flash(PLANNER_PROMPT, payload)
+    chosen = result.get('tools', [])
+    rationale = result.get('rationale', '')
+    # Validate — only accept known tool names
+    valid = [t for t in chosen if t in _VALID_TOOLS]
+    if not valid:
+        # Fallback to a safe default so the pipeline never stalls
+        valid = ['read_forecast_accuracy', 'read_recurring_drivers']
+    print(f'    planner chose {valid} — {rationale}')
+    return valid
+
 
 def run_hypothesis(
     client: DeepSeekClient,

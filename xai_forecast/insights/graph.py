@@ -19,7 +19,7 @@ from typing import Annotated, Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from .agents import run_hypothesis, run_critic, run_synthesis
+from .agents import run_planner, run_hypothesis, run_critic, run_synthesis
 from .detectors import run_all_detectors
 from .llm_client import DeepSeekClient
 from .schemas import CandidateFinding, LedgerRow
@@ -34,24 +34,12 @@ from .tools import (
 )
 
 
-# ── Planner: choose tools per finding type ────────────────────────────────────
-
-_TOOL_PLAN: dict[str, list[str]] = {
-    'over_forecast_bias':       ['read_forecast_accuracy', 'read_recurring_drivers'],
-    'dominant_driver':          ['read_recurring_drivers', 'read_forecast_accuracy', 'read_model_metadata'],
-    'demand_cliff':             ['read_demand_trajectory', 'read_xai_findings', 'read_bad_weeks'],
-    'external_coincidence':     ['read_bad_weeks', 'read_external_signals', 'read_xai_findings'],
-    'counterfactual_material':  ['read_xai_findings', 'read_bad_weeks'],
-    'contrastive_gap':          ['read_xai_findings', 'read_bad_weeks'],
-}
-
-
 def _enrich_evidence(
     conn: sqlite3.Connection,
     finding: CandidateFinding,
+    tools_to_run: list[str],
 ) -> dict[str, Any]:
-    """Call the planned read-tools for this finding type and merge into evidence."""
-    tools_to_run = _TOOL_PLAN.get(finding.finding_type, ['read_forecast_accuracy'])
+    """Call the planner-chosen read-tools and merge results into the evidence dict."""
     enriched = dict(finding.evidence)
 
     for tool_name in tools_to_run:
@@ -142,11 +130,14 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
         ]
 
     def review_finding(state: dict) -> dict:
-        """Per-finding node: enrich → hypothesis → grounding check → critic → LedgerRow."""
+        """Per-finding node: plan → enrich → hypothesis → grounding check → critic → LedgerRow."""
         finding: CandidateFinding = state['finding']
 
+        print(f'  [{finding.finding_type}] planning evidence gathering (Flash)...')
+        tools_to_run = run_planner(client, finding)
+
         print(f'  [{finding.finding_type}] enriching evidence...')
-        enriched = _enrich_evidence(conn, finding)
+        enriched = _enrich_evidence(conn, finding, tools_to_run)
 
         print(f'  [{finding.finding_type}] running hypothesis (Flash)...')
         hypothesis = run_hypothesis(client, finding, enriched)
