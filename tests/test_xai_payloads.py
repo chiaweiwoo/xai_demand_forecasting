@@ -81,7 +81,7 @@ def test_shap_cache_returned(shap_result):
 
 
 def test_shap_additivity(trained_model_and_explainer, week_df):
-    """base_log + sum(all 19 SHAP values) ≈ log(prediction), from raw (unrounded) values."""
+    """base_log + sum(all SHAP values) ≈ log(prediction), from raw (unrounded) values."""
     model, explainer = trained_model_and_explainer
     rows_feat = week_df[['unique_id'] + FEATURE_COLS].fillna(0)
     X = rows_feat[FEATURE_COLS]

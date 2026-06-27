@@ -1,0 +1,13 @@
+-- Stage 2: add 7 external signal columns to features table.
+-- Schema change is applied idempotently via db._ensure_external_cols()
+-- called from build_features.py at rebuild time, not via executescript().
+-- This file is documentation only; no runtime SQL to execute.
+--
+-- Columns added:
+--   temp_mean         REAL   -- weekly mean of daily mean temp (C), LA proxy
+--   temp_max          REAL   -- weekly max of daily max temp (C)
+--   temp_min          REAL   -- weekly min of daily min temp (C)
+--   precip            REAL   -- weekly total precipitation (mm)
+--   heat_days         INTEGER -- days in week with daily max > 32C
+--   gas_price         REAL   -- CA regular retail gasoline ($/gal)
+--   consumer_sentiment REAL  -- U. Michigan consumer sentiment index

@@ -33,7 +33,7 @@ from xai_forecast.db import (
     get_conn, get_all_weeks, load_features_window, load_features_week, load_raw_window,
     insert_forecasts, insert_evaluations, insert_xai, week_summary,
 )
-from xai_forecast.features import FEATURE_COLS, compute_features
+from xai_forecast.features import FEATURE_COLS, EXTERNAL_SIGNAL_COLS, compute_features
 from xai_forecast.train import train_model
 from xai_forecast.forecast import make_forecasts
 from xai_forecast.evaluate import evaluate_h1, flag_bad_weeks
@@ -90,7 +90,13 @@ def check_feature_staleness(source_conn, weeks: list[str]) -> None:
     if raw_df.empty:
         fail('Could not load raw data for staleness check')
 
-    recomp = compute_features(raw_df)
+    # Load external signals so the staleness check compares apples-to-apples
+    ext_df = pd.read_sql(
+        f"SELECT week, {', '.join(EXTERNAL_SIGNAL_COLS)} FROM external_signals",
+        source_conn,
+    ) if source_conn.execute('SELECT COUNT(*) FROM external_signals').fetchone()[0] > 0 else None
+
+    recomp = compute_features(raw_df, ext_df=ext_df)
     recomp_week = recomp[recomp['week'] == check_week].set_index('unique_id')
     stored_week  = stored[stored['unique_id'].isin(sample_uids)].set_index('unique_id')
 

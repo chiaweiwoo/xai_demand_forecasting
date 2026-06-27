@@ -15,6 +15,26 @@ def _setup_schema(conn: sqlite3.Connection) -> None:
         conn.executescript(path.read_text())
 
 
+def _ensure_external_cols(conn: sqlite3.Connection) -> None:
+    """Add external signal columns to the features table if not already present.
+    Called by build_features.py before writing. Safe to call multiple times.
+    """
+    existing = {row[1] for row in conn.execute('PRAGMA table_info(features)').fetchall()}
+    additions = [
+        ('temp_mean',          'REAL'),
+        ('temp_max',           'REAL'),
+        ('temp_min',           'REAL'),
+        ('precip',             'REAL'),
+        ('heat_days',          'INTEGER'),
+        ('gas_price',          'REAL'),
+        ('consumer_sentiment', 'REAL'),
+    ]
+    for col, dtype in additions:
+        if col not in existing:
+            conn.execute(f'ALTER TABLE features ADD COLUMN {col} {dtype}')
+    conn.commit()
+
+
 def get_conn(path: str | Path = DB_PATH) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -23,6 +43,7 @@ def get_conn(path: str | Path = DB_PATH) -> sqlite3.Connection:
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA synchronous=NORMAL')
     _setup_schema(conn)
+    _ensure_external_cols(conn)
     return conn
 
 

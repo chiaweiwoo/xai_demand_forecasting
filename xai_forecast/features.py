@@ -18,6 +18,16 @@ FEATURE_COLS = [
     'snap', 'has_event', 'event_type_enc',
     'sell_price', 'price_change_pct',
     'dept_mean_sales', 'cat_mean_sales',
+    # External signals (Stage 2) — contemporaneous timing: week-t signal joined to week-t forecast.
+    # Mild deliberate lookahead accepted for retrospective explainability (EXTERNAL_SIGNALS_PLAN.md, decision 2).
+    # Absent in tests (filled 0.0); always present in production (ingest_external.py covers all 278 weeks).
+    'temp_mean', 'temp_max', 'temp_min', 'precip', 'heat_days',
+    'gas_price', 'consumer_sentiment',
+]
+
+EXTERNAL_SIGNAL_COLS = [
+    'temp_mean', 'temp_max', 'temp_min', 'precip', 'heat_days',
+    'gas_price', 'consumer_sentiment',
 ]
 
 # Extra weeks fetched before training window so lag_52 is non-NaN for first training week
@@ -26,11 +36,16 @@ HISTORY_BUFFER = 52
 
 # ── Feature engineering ───────────────────────────────────────────────────────
 
-def compute_features(raw_df: pd.DataFrame) -> pd.DataFrame:
+def compute_features(
+    raw_df: pd.DataFrame,
+    ext_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """
     Compute feature matrix from a raw joined DataFrame.
     raw_df columns: week, unique_id, y, snap, has_event, event_type_enc,
                     sell_price, dept_mean_sales, cat_mean_sales
+    ext_df: optional DataFrame from external_signals table (week + 7 signal cols).
+            When None (tests), external columns are filled with 0.0.
 
     Leakage controls:
     - lag_*: shift(n) per SKU — lag_1 at week t uses sales[t-1]
@@ -38,6 +53,8 @@ def compute_features(raw_df: pd.DataFrame) -> pd.DataFrame:
     - sell_price NaN: ffill within item only — no backward fill, no future data
     - dept_mean_sales / cat_mean_sales: static prior over full history (deliberate mild
       lookahead accepted for stability — 7 dept / 3 cat scalars, low signal risk)
+    - External signals: contemporaneous (week t signal at week t forecast). Deliberate
+      mild lookahead accepted for retrospective explainability (decision 2).
     """
     warnings.filterwarnings('ignore', category=FutureWarning)
     warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -79,5 +96,13 @@ def compute_features(raw_df: pd.DataFrame) -> pd.DataFrame:
     # dept_mean_sales / cat_mean_sales — static priors, pass through as-is
     df['dept_mean_sales'] = df['dept_mean_sales'].fillna(0)
     df['cat_mean_sales']  = df['cat_mean_sales'].fillna(0)
+
+    # External signals — LEFT JOIN on week, contemporaneous timing
+    if ext_df is not None:
+        ext = ext_df[['week'] + EXTERNAL_SIGNAL_COLS].copy()
+        df = df.merge(ext, on='week', how='left')
+    else:
+        for col in EXTERNAL_SIGNAL_COLS:
+            df[col] = 0.0
 
     return df
