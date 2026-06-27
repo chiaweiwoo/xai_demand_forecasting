@@ -162,7 +162,11 @@ Findings from full-run analysis (120 backtest weeks, 16 bad weeks, 800 SHAP payl
 - **Contrastive coverage is 27%** (171 of 645 explained items). Only items with a same-WOY week where MAPE < 15% get contrastive data. 73% of items have no contrastive panel in the dashboard.
 - **LLM item narratives add little value** — they paraphrase SHAP feature names without explaining the actual demand event (e.g. "demand collapsed from 65 to 1 unit — demand cliff" vs "recent trend shifted").
 
-**Planned improvements (not yet implemented):**
+**Project reframe (current direction):** the goal is not better forecast accuracy — it is **XAI-driven model governance**. Use the backtest + XAI to produce (a) a data-scientist "what to fix" list and (b) a business-facing "limitations + improvement plan". Model performance is explicitly not the focus; feature engineering stays lean.
+
+**Active plan — external signals:** see [EXTERNAL_SIGNALS_PLAN.md](EXTERNAL_SIGNALS_PLAN.md). Adds a curated fast set of real, committed external signals (LA weather, CA gas price, consumer sentiment) so the XAI has real-world causes to point at instead of only autoregressive lags. Two-stage: Stage 1 = external ingestion only (hard stop + validation gate), Stage 2 = lean feature wiring → backtest → xai → narratives → a new "Model Limitations & Improvement Plan" dashboard view. The full plan, locked decisions, sources, and validation anchors live in that file.
+
+**Other planned improvements (not yet implemented):**
 1. **Failure pattern classification** — derive pattern type from SHAP data before the LLM call: `demand_cliff` (lag_1 >> actual), `demand_spike` (lag_1 << actual), `price_driven` (sell_price top driver), `seasonal_drift` (lag_52 / week_of_year top driver). Pass as a label in the dossier so narratives are targeted.
 2. **Deterministic item narratives** — replace LLM item-level calls with a template that embeds concrete numbers (prediction, actual, lag_1 value, top SHAP contributor). Reserve LLM for week and executive scope only.
 3. **Wider contrastive WOY window** — relax exact same-WOY match to ±2 weeks to raise contrastive coverage from 27% toward ~70%.
