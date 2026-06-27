@@ -173,6 +173,8 @@ def main() -> None:
     # ── Write to throwaway smoke DB (never touches forecasting.db) ──
     t = time.perf_counter()
     conn = get_conn(SMOKE_DB)
+    conn.executescript('DELETE FROM forecasts; DELETE FROM evaluations; DELETE FROM xai_results;')
+    conn.commit()
     for r in results.values():
         fw = r['forecast_week']
         insert_forecasts(conn, [

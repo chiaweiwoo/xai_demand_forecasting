@@ -8,7 +8,7 @@ then do a plain SQL SELECT instead of recomputing features at each iteration.
 Usage:
     uv run python build_features.py
 
-Takes ~2-3 min. Safe to re-run (clears and rebuilds).
+Takes ~1 min. Always clears and rebuilds — safe to re-run.
 """
 
 import time
@@ -30,12 +30,11 @@ def main() -> None:
         conn.close()
         return
 
-    # Check if already built
     n_existing = conn.execute('SELECT COUNT(*) FROM features').fetchone()[0]
     if n_existing > 0:
-        print(f'Features table already has {n_existing:,} rows. Delete db/forecasting.db to rebuild.')
-        conn.close()
-        return
+        print(f'Clearing {n_existing:,} existing rows...')
+        conn.execute('DELETE FROM features')
+        conn.commit()
 
     print(f'Building feature store: {len(weeks)} weeks x 3049 SKUs...')
 
