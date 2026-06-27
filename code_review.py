@@ -492,7 +492,7 @@ elif section == '💬  LLM Narrative':
 
     with tab2:
         st.markdown('#### build_week_dossier — aggregates SHAP across all items in a bad week')
-        st.code(_excerpt(narrate_src, 96, 136), language='python')
+        st.code(_excerpt(narrate_src, 100, 141), language='python')
 
         st.markdown('#### compute_recurring_drivers — cross-week frequency analysis')
         _note(
@@ -506,14 +506,14 @@ elif section == '💬  LLM Narrative':
             'The executive prompt uses pct_bad_weeks for confidence thresholding.',
             border='#6a1b9a',
         )
-        st.code(_excerpt(narrate_src, 184, 220), language='python')
+        st.code(_excerpt(narrate_src, 188, 224), language='python')
 
     with tab3:
         _file_badge('xai_forecast/narrate.py — DeepSeekNarrator.generate()')
         col1, col2 = st.columns([3, 2])
         with col1:
             st.code(_excerpt(narrate_src, 20, 29), language='python')
-            st.code(_excerpt(narrate_src, 261, 318), language='python')
+            st.code(_excerpt(narrate_src, 265, 329), language='python')
         with col2:
             st.markdown('#### MAX_NARRATIVE_TOKENS')
             _note(
@@ -547,7 +547,7 @@ elif section == '💬  LLM Narrative':
     with tab4:
         st.markdown('#### Three prompt constants')
         _file_badge('xai_forecast/narrate.py — WEEK_NARRATIVE_PROMPT / ITEM_NARRATIVE_PROMPT / EXECUTIVE_NARRATIVE_PROMPT')
-        st.code(_excerpt(narrate_src, 32, 92), language='python')
+        st.code(_excerpt(narrate_src, 32, 95), language='python')
         _note(
             'All three prompts share the same pattern:<br>'
             '1. Role framing (retail analyst)<br>'
@@ -718,7 +718,7 @@ elif section == '📊  Dashboard':
 
     app_src = _read('app.py')
 
-    st.markdown('**Run:** `uv run streamlit run app.py` → `localhost:8501`')
+    st.markdown('**Run:** `uv run streamlit run app.py` → `localhost:7501`')
 
     st.markdown('#### Pages')
     pages = {

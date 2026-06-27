@@ -17,7 +17,8 @@ uv run python smoke_test.py      # sanity check before full run (staleness, cont
 uv run python backtest.py        # full backtest (~120 weeks, ~30 retrains)
 uv run python data_quality.py    # post-backtest integrity checks (run before opening dashboard)
 uv run streamlit run app.py      # dashboard at localhost:8501
-uv run pytest                    # 73 tests covering features, evaluation, XAI contracts, DB, end-to-end, narratives
+uv run streamlit run code_review.py --server.port 7501  # code walkthrough app
+uv run pytest                    # 84 tests covering features, evaluation, XAI contracts, DB, end-to-end, narratives
 ```
 
 **Critical invariant: rebuild the feature store whenever `features.py` changes.**
