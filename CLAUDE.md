@@ -43,6 +43,14 @@ smoke_test.py           Sanity check: feature staleness, parallel forecast, cont
 data_quality.py         Post-run: referential integrity, h1>=0, pre-launch price leakage, etc.
 app.py                  Streamlit dashboard (4 pages — see Dashboard section)
 
+ingest_external.py      Stage 1: reads committed external_data/*.csv → external_signals table.
+                        Sat–Fri weather roll-up, fiscal-week gas mapping, monthly sentiment ffill. Idempotent.
+                        NOTE: external_signals is NOT yet consumed by features.py (Stage 2 will wire it in).
+validate_external.py    Stage 1 gate: 21 PASS/FAIL checks (coverage + structural + real-world anchors).
+tools/
+  fetch_external_raw.py Run-once internet fetch (Open-Meteo LA weather, EIA CA gas, FRED sentiment) →
+                        external_data/ CSVs. NOT part of the pipeline — the pipeline reads the committed CSVs offline.
+
 xai_forecast/
   features.py      FEATURE_COLS, compute_features(raw_df) — single source of truth for all features
   db.py            SQLite helpers: get_conn (auto-applies schema), load_features_window,
@@ -72,9 +80,11 @@ migrations/
   002_output_tables.sql  forecasts, evaluations, xai_results (+ indexes)
   003_features_table.sql features (+ index on week)
   004_narratives.sql     narratives (scope, key, payload, model, created_at) — PRIMARY KEY (scope, key)
+  005_external.sql       external_signals (week PK + 7 signal cols, index on week)
 
-data/   M5 raw files (gitignored — downloaded by ingest.py)
-db/     SQLite databases (gitignored): forecasting.db (production), smoke.db (throwaway)
+data/          M5 raw files (gitignored — downloaded by ingest.py)
+external_data/ Committed external-signal CSVs (NOT gitignored — pipeline reads these offline, never the internet)
+db/            SQLite databases (gitignored): forecasting.db (production), smoke.db (throwaway)
 ```
 
 Schema is applied automatically by `get_conn()` via `_setup_schema()` — no manual migration step. To add schema changes: add `00N_description.sql` to `migrations/`. Never edit existing migration files.
@@ -92,6 +102,7 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 | `evaluations` | backtest.py | MAPE, MAE, WMAPE z-score, bad-week flag per SKU per week |
 | `xai_results` | run_xai.py | JSON payloads: shap / counterfactual / contrastive |
 | `narratives` | generate_narratives.py | LLM-generated narratives (scope: week/item/executive), keyed by (scope, key) |
+| `external_signals` | ingest_external.py | Per-fiscal-week LA weather + CA gas + consumer sentiment (Stage 1). NOT yet read by features.py |
 
 ## Key design decisions
 
@@ -165,6 +176,8 @@ Findings from full-run analysis (120 backtest weeks, 16 bad weeks, 800 SHAP payl
 **Project reframe (current direction):** the goal is not better forecast accuracy — it is **XAI-driven model governance**. Use the backtest + XAI to produce (a) a data-scientist "what to fix" list and (b) a business-facing "limitations + improvement plan". Model performance is explicitly not the focus; feature engineering stays lean.
 
 **Active plan — external signals:** see [EXTERNAL_SIGNALS_PLAN.md](EXTERNAL_SIGNALS_PLAN.md). Adds a curated fast set of real, committed external signals (LA weather, CA gas price, consumer sentiment) so the XAI has real-world causes to point at instead of only autoregressive lags. Two-stage: Stage 1 = external ingestion only (hard stop + validation gate), Stage 2 = lean feature wiring → backtest → xai → narratives → a new "Model Limitations & Improvement Plan" dashboard view. The full plan, locked decisions, sources, and validation anchors live in that file.
+
+**Stage 1 status: DONE (committed, gate passed).** `external_signals` is populated for all 278 fiscal weeks (2011-01-29 → 2016-05-21), zero gaps. Data is committed real CSVs under `external_data/` (Open-Meteo LA weather, EIA CA gas, U. Michigan consumer sentiment). `validate_external.py` runs 21 checks — all pass, including real-world anchors (Oct-2012 gas spike $4.71, Q1-2016 gas low $2.35, Aug-2011 sentiment 55.7, 2015 sentiment peak 98.1, 2013–15 drought precip below 2011). Gas maps to all 278 weeks with a direct EIA reading (no ffill needed). **Sentiment caveat:** FRED was unreachable from the build machine, so `tools/fetch_external_raw.py` fell back to embedded real historical UMCSENT values (verifiable on FRED); it tries the live endpoint first. **Stage 2 is NOT started** — `features.py`, `FEATURE_COLS`, models, and narratives are all unchanged; the signals are ingested but not yet used by the model.
 
 **Other planned improvements (not yet implemented):**
 1. **Failure pattern classification** — derive pattern type from SHAP data before the LLM call: `demand_cliff` (lag_1 >> actual), `demand_spike` (lag_1 << actual), `price_driven` (sell_price top driver), `seasonal_drift` (lag_52 / week_of_year top driver). Pass as a label in the dossier so narratives are targeted.

@@ -1,10 +1,17 @@
 # External Signals — Implementation Plan
 
-**Status:** Planned, not yet built. Stage 1 ready for execution.
+**Status:** **Stage 1 DONE (committed, gate passed). Stage 2 not started.**
 **Owner handoff:** Written on Opus (planning). Execution must run on **Sonnet** (project rule: Opus plans, Sonnet executes).
 **Last updated:** 2026-06-27
 
-This document is self-contained. A fresh AI session should be able to execute Stage 1 from this file alone.
+This document is self-contained. A fresh AI session should be able to execute Stage 2 from this file alone.
+
+> **Stage 1 result (do not redo):** `external_signals` populated for all 278 fiscal weeks, zero gaps. Real CSVs
+> committed under `external_data/`. `validate_external.py` passes all 21 checks (anchors: Oct-2012 gas $4.71,
+> Q1-2016 gas $2.35, Aug-2011 sentiment 55.7, 2015 peak 98.1, drought precip). Gas matched all 278 weeks directly
+> (no ffill). **Sentiment note:** FRED was unreachable from the build machine; `tools/fetch_external_raw.py` fell
+> back to embedded real historical UMCSENT values (it tries live FRED first). Nothing downstream was touched —
+> `features.py`, `FEATURE_COLS`, models, narratives are all unchanged. **Next: Stage 2 (section 5).**
 
 ---
 
@@ -140,14 +147,14 @@ to `data_quality.py` so they re-verify on every later pipeline run.
 
 ### 4.5 Stage 1 success criteria (the gate to Stage 2)
 
-- [ ] `external_signals` populated, **one row per fiscal week**, full coverage 2011-01-29 → 2016-05-21, zero gaps.
-- [ ] Real data **committed as CSV** under `external_data/` (version-controlled, offline-reproducible).
-- [ ] **All explicit anchors pass.**
-- [ ] **All implicit checks pass.**
-- [ ] Printed PASS/FAIL validation report exists.
-- [ ] **Nothing downstream touched** — `features.py`, `FEATURE_COLS`, models, narratives all unchanged.
+- [x] `external_signals` populated, **one row per fiscal week**, full coverage 2011-01-29 → 2016-05-21, zero gaps.
+- [x] Real data **committed as CSV** under `external_data/` (version-controlled, offline-reproducible).
+- [x] **All explicit anchors pass.**
+- [x] **All implicit checks pass.**
+- [x] Printed PASS/FAIL validation report exists (`validate_external.py`, 21 checks).
+- [x] **Nothing downstream touched** — `features.py`, `FEATURE_COLS`, models, narratives all unchanged.
 
-When all boxes are green: **pause for human review**, then proceed to Stage 2.
+All boxes green (commit `64f3053`). **Stage 1 gate passed — awaiting human review before Stage 2.**
 
 ---
 
