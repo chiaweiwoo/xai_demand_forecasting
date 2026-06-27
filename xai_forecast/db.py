@@ -159,27 +159,65 @@ def load_all_shap_payloads(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
-# ── Narrative reads/writes ────────────────────────────────────────────────────
+# ── Insight reads/writes ──────────────────────────────────────────────────────
 
-def insert_narrative(conn: sqlite3.Connection, scope: str, key: str,
-                     payload: dict, model: str) -> None:
+def insert_insight_finding(conn: sqlite3.Connection, row: dict) -> None:
     conn.execute(
-        'INSERT OR REPLACE INTO narratives (scope, key, payload, model, created_at) VALUES (?, ?, ?, ?, ?)',
-        (scope, key, json.dumps(payload), model, datetime.utcnow().isoformat()),
+        'INSERT OR REPLACE INTO insight_findings '
+        '(finding_id, finding_type, status, confidence, evidence, hypothesis, critic_notes, created_at) '
+        'VALUES (:finding_id, :finding_type, :status, :confidence, :evidence, :hypothesis, :critic_notes, :created_at)',
+        row,
     )
     conn.commit()
 
 
-def load_narrative(conn: sqlite3.Connection, scope: str, key: str) -> dict | None:
-    cur = conn.execute('SELECT payload FROM narratives WHERE scope=? AND key=?', (scope, key))
+def insert_insight_summary(conn: sqlite3.Connection, data_scientist: dict,
+                            business_leader: dict, model_flash: str, model_critic: str) -> None:
+    conn.execute(
+        'INSERT OR REPLACE INTO insight_summary '
+        '(key, data_scientist, business_leader, model_flash, model_critic, created_at) '
+        'VALUES (?, ?, ?, ?, ?, ?)',
+        ('overall', json.dumps(data_scientist), json.dumps(business_leader),
+         model_flash, model_critic, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+
+
+def load_insight_summary(conn: sqlite3.Connection) -> dict | None:
+    cur = conn.execute(
+        'SELECT data_scientist, business_leader, model_flash, model_critic, created_at '
+        'FROM insight_summary WHERE key=?', ('overall',)
+    )
     row = cur.fetchone()
-    return json.loads(row[0]) if row else None
+    if not row:
+        return None
+    return {
+        'data_scientist':  json.loads(row[0]),
+        'business_leader': json.loads(row[1]),
+        'model_flash':     row[2],
+        'model_critic':    row[3],
+        'created_at':      row[4],
+    }
 
 
-def load_narratives_by_scope(conn: sqlite3.Connection, scope: str) -> dict[str, dict]:
-    """Returns {key: payload_dict} for all narratives with the given scope."""
-    cur = conn.execute('SELECT key, payload FROM narratives WHERE scope=?', (scope,))
-    return {row[0]: json.loads(row[1]) for row in cur.fetchall()}
+def load_insight_findings(conn: sqlite3.Connection) -> list[dict]:
+    cur = conn.execute(
+        'SELECT finding_id, finding_type, status, confidence, evidence, hypothesis, critic_notes, created_at '
+        'FROM insight_findings ORDER BY finding_id'
+    )
+    rows = []
+    for r in cur.fetchall():
+        rows.append({
+            'finding_id':   r[0],
+            'finding_type': r[1],
+            'status':       r[2],
+            'confidence':   r[3],
+            'evidence':     json.loads(r[4]) if r[4] else {},
+            'hypothesis':   json.loads(r[5]) if r[5] else None,
+            'critic_notes': r[6],
+            'created_at':   r[7],
+        })
+    return rows
 
 
 def week_summary(conn: sqlite3.Connection) -> pd.DataFrame:

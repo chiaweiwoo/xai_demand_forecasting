@@ -305,63 +305,45 @@ def main() -> None:
     if not all_ok:
         conn.close(); fail('One or more weeks failed validation')
 
-    # ── Narrative API probe ────────────────────────────────────────
-    # One live call to DeepSeek to validate API config before the full backtest.
-    # Fails loudly if the key is set but the call fails or returns a bad schema.
+    # ── Insights API probe ─────────────────────────────────────────
+    # One live call to DeepSeek Flash to validate API config.
+    # Fails loudly if the key is set but the call fails.
     # Skips silently if DEEPSEEK_API_KEY is not set.
-    print(f'\n[STEP] Narrative API probe')
-    _narrator = None
-    try:
-        from xai_forecast.narrate import DeepSeekNarrator, WEEK_NARRATIVE_PROMPT, build_week_dossier
-        from xai_forecast.db import insert_narrative, load_narrative as _load_narrative
-        _narrator = DeepSeekNarrator()
-    except ImportError:
-        print('  [SKIP] openai not installed — skipping narrative probe')
-
-    if _narrator and _narrator.available:
-        _probe_week = forecast_weeks[0]
-        _probe_shap_rows = results[_probe_week]['shap_rows']
-        if not _probe_shap_rows:
-            print('  [SKIP] No SHAP rows for probe week')
-        else:
-            _probe_doss = build_week_dossier(
-                _probe_week,
-                _probe_shap_rows,
-                wmape_zscore=2.0,
-                n_items_in_week=len(results[_probe_week]['eval_df']),
+    print(f'\n[STEP] Insights API probe')
+    import os as _os
+    _api_key = _os.environ.get('DEEPSEEK_API_KEY', '')
+    if not _api_key:
+        print('  [SKIP] DEEPSEEK_API_KEY not set — set in .env to enable insights generation')
+    else:
+        try:
+            from xai_forecast.insights.llm_client import DeepSeekClient as _DSClient
+            from xai_forecast.insights.agents import HYPOTHESIS_PROMPT as _HP
+            _client = _DSClient()
+            _probe = _client.call_flash(
+                _HP,
+                {
+                    'finding_type': 'smoke_probe',
+                    'summary': 'smoke test probe — ignore',
+                    'score': 0.0,
+                    'evidence': {'note': 'This is a smoke-test probe call. Return minimal valid JSON.'},
+                },
             )
-            _probe_narr = _narrator.generate(WEEK_NARRATIVE_PROMPT, _probe_doss)
-            if _probe_narr is None:
+            if 'headline' not in _probe:
                 conn.close()
                 fail(
-                    'Narrative API probe failed — DeepSeek returned None. '
-                    'Check DEEPSEEK_API_KEY, DEEPSEEK_MODEL, and DEEPSEEK_BASE_URL in .env'
+                    'Insights API probe: response missing "headline" key. '
+                    'Check DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL in .env'
                 )
-            for _k in ('headline', 'body', 'primary_driver', 'confidence'):
-                if _k not in _probe_narr:
-                    conn.close(); fail(f'Narrative probe response missing key: {_k}')
-
-            # DB round-trip: write to smoke.db and read back
-            _probe_conn = get_conn(SMOKE_DB)
-            insert_narrative(_probe_conn, 'week', _probe_week, _probe_narr, _narrator.model_id)
-            _recovered = _load_narrative(_probe_conn, 'week', _probe_week)
-            _probe_conn.close()
-            if _recovered is None or _recovered.get('headline') != _probe_narr['headline']:
-                conn.close(); fail('Narrative DB round-trip failed — insert or read back broken')
-
-            print(f'  [OK]  API call succeeded + DB round-trip passed')
-            print(f'        Headline:        {_probe_narr["headline"]}')
-            print(f'        Primary driver:  {_probe_narr["primary_driver"]}')
-            print(f'        Confidence:      {_probe_narr["confidence"]}')
-            if _probe_narr.get('grounding_warning'):
-                print(f'  [WARN] Grounding check flagged primary_driver — verify manually')
-    elif _narrator is not None:
-        print('  [SKIP] DEEPSEEK_API_KEY not set — set in .env to enable narrative generation')
+            print(f'  [OK]  API call succeeded — headline: {_probe.get("headline", "")[:60]}')
+        except RuntimeError as _exc:
+            conn.close(); fail(f'Insights API probe failed: {_exc}')
+        except Exception as _exc:
+            conn.close(); fail(f'Insights API probe unexpected error: {_exc}')
 
     # ── Write to throwaway smoke DB ────────────────────────────────
     t = time.perf_counter()
     smoke_conn = get_conn(SMOKE_DB)
-    smoke_conn.executescript('DELETE FROM forecasts; DELETE FROM evaluations; DELETE FROM xai_results; DELETE FROM narratives;')
+    smoke_conn.executescript('DELETE FROM forecasts; DELETE FROM evaluations; DELETE FROM xai_results; DELETE FROM insight_findings; DELETE FROM insight_summary;')
     smoke_conn.commit()
 
     all_eval_frames = []

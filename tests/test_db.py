@@ -9,7 +9,8 @@ import pytest
 from xai_forecast.db import (
     get_conn,
     insert_forecasts, insert_evaluations, insert_xai,
-    insert_narrative, load_narrative, load_narratives_by_scope,
+    insert_insight_finding, insert_insight_summary,
+    load_insight_summary, load_insight_findings,
     load_features_week,
     week_summary,
 )
@@ -128,37 +129,67 @@ def test_week_summary_counts(db_conn):
     assert w1['n_bad_items'] == 1
 
 
-# ── Narrative CRUD ────────────────────────────────────────────────────────────
+# ── Insight CRUD ─────────────────────────────────────────────────────────────
 
-def test_insert_narrative_readback(db_conn):
-    payload = {'headline': 'Test headline', 'body': 'Body text.',
-               'primary_driver': 'lag_1', 'confidence': 'high'}
-    insert_narrative(db_conn, 'week', '2015-01-01', payload, 'deepseek-v4-flash')
-    recovered = load_narrative(db_conn, 'week', '2015-01-01')
-    assert recovered is not None
-    assert recovered['headline'] == 'Test headline'
-    assert recovered['primary_driver'] == 'lag_1'
+import json as _json
+from datetime import datetime
 
 
-def test_insert_narrative_idempotent(db_conn):
-    """Second INSERT with same (scope, key) must overwrite, not duplicate."""
-    insert_narrative(db_conn, 'week', '2015-02-01', {'headline': 'v1', 'body': '', 'primary_driver': 'snap', 'confidence': 'low'}, 'model-a')
-    insert_narrative(db_conn, 'week', '2015-02-01', {'headline': 'v2', 'body': '', 'primary_driver': 'lag_1', 'confidence': 'high'}, 'model-b')
-    recovered = load_narrative(db_conn, 'week', '2015-02-01')
-    assert recovered['headline'] == 'v2'
-    count = db_conn.execute("SELECT COUNT(*) FROM narratives WHERE scope='week' AND key='2015-02-01'").fetchone()[0]
-    assert count == 1
+def _finding_dict(**kwargs):
+    defaults = dict(
+        finding_id='test-001', finding_type='over_forecast_bias',
+        status='accepted', confidence='high',
+        evidence=_json.dumps({'pct_over': 100.0}),
+        hypothesis=_json.dumps({'headline': 'All over-forecasts'}),
+        critic_notes='No overclaim detected.',
+        created_at=datetime.utcnow().isoformat(),
+    )
+    defaults.update(kwargs)
+    return defaults
 
 
-def test_load_narrative_missing_key_returns_none(db_conn):
-    result = load_narrative(db_conn, 'week', 'nonexistent-week')
+def test_insert_insight_finding_readback(db_conn):
+    insert_insight_finding(db_conn, _finding_dict())
+    findings = load_insight_findings(db_conn)
+    assert len(findings) == 1
+    assert findings[0]['finding_id'] == 'test-001'
+    assert findings[0]['status'] == 'accepted'
+    assert findings[0]['evidence']['pct_over'] == 100.0
+
+
+def test_insert_insight_finding_idempotent(db_conn):
+    """Second INSERT with same finding_id must overwrite, not duplicate."""
+    insert_insight_finding(db_conn, _finding_dict(
+        finding_id='test-002', finding_type='demand_cliff',
+        status='pending', confidence='low',
+        evidence=_json.dumps({'n': 3}), hypothesis=None, critic_notes=None,
+    ))
+    insert_insight_finding(db_conn, _finding_dict(
+        finding_id='test-002', finding_type='demand_cliff',
+        status='accepted', confidence='high',
+        evidence=_json.dumps({'n': 5}),
+        hypothesis=_json.dumps({'headline': 'Updated'}), critic_notes='ok',
+    ))
+    findings = load_insight_findings(db_conn)
+    assert len(findings) == 1
+    assert findings[0]['status'] == 'accepted'
+
+
+def test_insert_insight_summary_readback(db_conn):
+    insert_insight_summary(
+        db_conn,
+        data_scientist={'text': 'Fix rolling features.'},
+        business_leader={'text': 'Model over-forecasts by 30%.'},
+        model_flash='deepseek-v4-flash',
+        model_critic='deepseek-v4-pro',
+    )
+    summary = load_insight_summary(db_conn)
+    assert summary is not None
+    assert 'data_scientist' in summary
+    assert summary['data_scientist']['text'] == 'Fix rolling features.'
+    assert summary['business_leader']['text'] == 'Model over-forecasts by 30%.'
+
+
+def test_load_insight_summary_missing_returns_none(db_conn):
+    result = load_insight_summary(db_conn)
     assert result is None
-
-
-def test_load_narratives_by_scope_multi_row(db_conn):
-    insert_narrative(db_conn, 'item', '2015-01-01::A', {'headline': 'Item A', 'body': '', 'primary_driver': 'lag_1', 'confidence': 'medium'}, 'm')
-    insert_narrative(db_conn, 'item', '2015-01-01::B', {'headline': 'Item B', 'body': '', 'primary_driver': 'snap', 'confidence': 'low'}, 'm')
-    result = load_narratives_by_scope(db_conn, 'item')
-    assert '2015-01-01::A' in result
-    assert '2015-01-01::B' in result
-    assert result['2015-01-01::A']['headline'] == 'Item A'

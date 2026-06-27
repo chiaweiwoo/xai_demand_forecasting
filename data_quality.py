@@ -149,6 +149,30 @@ def main() -> None:
         f'{n_prelaunch_with_price} suspicious rows'
     )
 
+    # ── Insights tables (Stage 3) ────────────────────────────────────────────
+    try:
+        n_findings = conn.execute('SELECT COUNT(*) FROM insight_findings').fetchone()[0]
+        n_summary  = conn.execute('SELECT COUNT(*) FROM insight_summary').fetchone()[0]
+        if n_findings == 0 and n_summary == 0:
+            print(f'  {_WARN}  insight tables empty (run: uv run python generate_insights.py)')
+        else:
+            all_ok &= _check('insight_findings non-empty', n_findings > 0, f'{n_findings} rows')
+            all_ok &= _check('insight_summary present', n_summary > 0, f'{n_summary} rows')
+            n_accepted = conn.execute(
+                "SELECT COUNT(*) FROM insight_findings WHERE status='accepted'"
+            ).fetchone()[0]
+            _check('at least 1 accepted finding', n_accepted > 0, f'{n_accepted} accepted')
+            n_bad_json = 0
+            for (ev,) in conn.execute('SELECT evidence FROM insight_findings LIMIT 50').fetchall():
+                try:
+                    import json as _json
+                    _json.loads(ev)
+                except Exception:
+                    n_bad_json += 1
+            all_ok &= _check('insight_findings evidence is valid JSON', n_bad_json == 0, f'{n_bad_json} invalid')
+    except Exception as exc:
+        print(f'  {_WARN}  insight table check failed: {exc}')
+
     # ── External signals (Stage 2) ───────────────────────────────────────────
     n_ext = conn.execute('SELECT COUNT(*) FROM external_signals').fetchone()[0]
     if n_ext == 0:

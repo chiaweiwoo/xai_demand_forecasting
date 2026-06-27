@@ -13,6 +13,7 @@ dependencies = [
     "tqdm>=4.65",
     "openai>=1.30",
     "python-dotenv>=1.0",
+    "langgraph>=1.2.6",
 ]
 
 [build-system]
