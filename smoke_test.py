@@ -61,7 +61,7 @@ def run_week(forecast_week: str, weeks: list, model, explainer) -> dict:
 
     top_items  = eval_df.nlargest(TOP_N, 'mape')['unique_id'].tolist()
     actual_map = dict(zip(eval_df['unique_id'], eval_df['actual']))
-    shap_rows  = shap_payloads(explainer, model, week_df, forecast_week, top_items, actual_map)
+    shap_rows, _ = shap_payloads(explainer, model, week_df, forecast_week, top_items, actual_map)
     cf_rows    = counterfactual_payloads(model, week_df, forecast_week, top_items, actual_map)
 
     t_total = time.perf_counter() - t0

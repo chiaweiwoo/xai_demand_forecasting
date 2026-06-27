@@ -170,9 +170,17 @@ elif page == 'XAI Explorer':
             values = [f['shap_value'] for f in feats]
             base_log = d['base_value_log']
 
+            other_shap = d.get('other_features_shap')
+            n_other = 19 - len(feats)
+            if other_shap is not None:
+                labels = labels + [f'other {n_other} features']
+                values = values + [other_shap]
+
+            measures = ['relative'] * len(labels) + ['total']
+
             fig = go.Figure(go.Waterfall(
                 orientation='h',
-                measure=['relative'] * len(feats) + ['total'],
+                measure=measures,
                 y=labels + ['log-margin total'],
                 x=values + [0],
                 base=base_log,
@@ -181,9 +189,9 @@ elif page == 'XAI Explorer':
                 decreasing={'marker': {'color': 'steelblue'}},
             ))
             fig.update_layout(
-                title='SHAP waterfall — top 5 features (log-margin contributions)',
+                title='SHAP waterfall — top 5 features + residual (log-margin contributions)',
                 xaxis_title='Log-margin contribution',
-                height=340, margin=dict(l=200),
+                height=380, margin=dict(l=200),
             )
             st.plotly_chart(fig, use_container_width=True)
             st.caption(
@@ -230,14 +238,16 @@ elif page == 'XAI Explorer':
             st.info('No contrastive data (no matching good week found).')
         else:
             d = xai['contrastive']
+            matched = d.get('seasonality_matched', False)
             st.markdown(
                 f"**Bad week:** {d['bad_week']}  ↔  "
                 f"**Reference good week:** {d['good_week']} "
                 f"(MAPE {d['good_week_mape']:.1f}%)"
+                + ('  ✓ same week-of-year' if matched else '')
             )
             st.caption(
                 'Comparing SHAP values between this bad week and a historical week '
-                'with similar seasonality where the model performed well. '
+                'with the same ISO week-of-year where the model performed well. '
                 'Features with large SHAP differences are the structural divergence.'
             )
 

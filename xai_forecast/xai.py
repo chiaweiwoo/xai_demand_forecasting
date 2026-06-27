@@ -1,5 +1,16 @@
+"""
+XAI payloads: SHAP, counterfactual, contrastive.
+
+All payload functions return list[dict] with keys: week_id, item_id, xai_type, payload (JSON str).
+
+shap_payloads additionally returns a shap_cache {uid: 1-D shap array} so contrastive can
+reuse bad-item SHAP values without recomputing them.
+"""
+
 import json
 import sqlite3
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 import shap
@@ -25,10 +36,20 @@ def shap_payloads(
     forecast_week: str,
     items: list[str],
     actual_map: dict[str, float],
-) -> list[dict]:
+) -> tuple[list[dict], dict[str, np.ndarray]]:
+    """
+    Returns (db_rows, shap_cache).
+
+    shap_cache maps uid -> full 1-D SHAP array (len = FEATURE_COLS) in log-margin space.
+    Pass shap_cache to contrastive_payloads to avoid recomputing bad-item SHAP there.
+
+    Payload includes other_features_shap (sum of non-top-5 contributions) so the waterfall
+    in app.py can show an honest residual bar that reconciles to the actual log-prediction:
+        base_value_log + Σ(top5 shap) + other_features_shap ≈ log(prediction)
+    """
     rows = week_df[week_df['unique_id'].isin(items)][['unique_id'] + FEATURE_COLS].fillna(0)
     if rows.empty:
-        return []
+        return [], {}
 
     X = rows[FEATURE_COLS]
     sv = explainer.shap_values(X)
@@ -38,8 +59,13 @@ def shap_payloads(
     preds = model.predict(X).clip(min=0)
 
     results = []
+    shap_cache: dict[str, np.ndarray] = {}
     for i, uid in enumerate(rows['unique_id']):
+        shap_cache[uid] = sv[i]
         top_idx = np.argsort(np.abs(sv[i]))[::-1][:5]
+        other_idx = np.argsort(np.abs(sv[i]))[::-1][5:]
+        other_shap = float(np.sum(sv[i][other_idx]))
+
         actual = actual_map.get(uid, np.nan)
         results.append({
             'week_id': forecast_week,
@@ -51,6 +77,7 @@ def shap_payloads(
                 'actual': round(float(actual), 4) if not np.isnan(actual) else None,
                 'error_pct': round(abs(float(preds[i]) - actual) / actual * 100, 2) if actual > 0 else None,
                 'shap_note': 'values in log-margin space (Tweedie log-link); ranking by |shap| is valid',
+                'other_features_shap': round(other_shap, 4),
                 'top_features': [
                     {
                         'feature': FEATURE_COLS[j],
@@ -61,7 +88,7 @@ def shap_payloads(
                 ],
             }),
         })
-    return results
+    return results, shap_cache
 
 
 def counterfactual_payloads(
@@ -100,11 +127,15 @@ def counterfactual_payloads(
                 'scenarios': [
                     {
                         'scenario': scenario,
+                        # was_active: True if any overridden feature was non-zero for this SKU
+                        'was_active': any(float(X_orig.iloc[i][col]) != 0 for col in overrides),
                         'prediction_cf': round(float(cf_preds[scenario][i]), 4),
                         'delta': round(float(cf_preds[scenario][i]) - orig, 4),
-                        'delta_pct': round((float(cf_preds[scenario][i]) - orig) / orig * 100 if orig > 0 else 0, 2),
+                        'delta_pct': round(
+                            (float(cf_preds[scenario][i]) - orig) / orig * 100 if orig > 0 else 0, 2
+                        ),
                     }
-                    for scenario, _ in _CF_PERTURBATIONS
+                    for scenario, overrides in _CF_PERTURBATIONS
                 ],
             }),
         })
@@ -118,53 +149,103 @@ def contrastive_payloads(
     items: list[str],
     all_evals: pd.DataFrame,
     conn: sqlite3.Connection,
+    bad_shap_cache: dict[str, np.ndarray] | None = None,
 ) -> list[dict]:
     """
-    For each bad item find a good reference week (same week-of-year, MAPE < 15%)
-    and diff the SHAP profiles. Fetches reference feature rows from the feature store.
+    For each bad item find a good reference week (same ISO week-of-year, MAPE < 15%)
+    and diff the SHAP profiles.
+
+    Items with no same-WOY good week are skipped — no fallback to a different-seasonality
+    week (that would break the "similar context" claim in the explanation).
+
+    Reference features are loaded once per unique ref week (not once per item).
+    Bad-item SHAP from shap_payloads is reused via bad_shap_cache when available,
+    avoiding a second explainer call per item.
     """
     from xai_forecast.db import load_features_week
 
     bad_woy = pd.Timestamp(forecast_week).isocalendar()[1]
-    results = []
 
+    # ── Resolve ref week for each item (same WOY only) ──────────────────────
+    item_ref: dict[str, tuple[str, float]] = {}  # uid -> (ref_forecast_week, good_mape)
     for uid in items:
         good_weeks = all_evals[
             (all_evals['unique_id'] == uid) & (all_evals['mape'] < 15)
-        ].copy()
+        ]
         if good_weeks.empty:
             continue
-
         same_woy = good_weeks[
             good_weeks['forecast_week'].apply(
                 lambda w: pd.Timestamp(w).isocalendar()[1] == bad_woy
             )
         ]
-        ref_row = same_woy.iloc[-1] if not same_woy.empty else good_weeks.iloc[-1]
-        ref_forecast_week = ref_row['forecast_week']
+        if same_woy.empty:
+            continue  # no same-WOY good week — skip rather than use different seasonality
+        ref_row = same_woy.iloc[-1]
+        item_ref[uid] = (ref_row['forecast_week'], float(ref_row['mape']))
 
-        ref_df   = load_features_week(conn, ref_forecast_week)
-        ref_item = ref_df[ref_df['unique_id'] == uid]
-        bad_item = week_df[week_df['unique_id'] == uid]
+    if not item_ref:
+        return []
 
-        if ref_item.empty or bad_item.empty:
+    # ── Load ref features once per unique ref week ───────────────────────────
+    ref_week_cache: dict[str, pd.DataFrame] = {}
+    for ref_fw in set(rw for rw, _ in item_ref.values()):
+        ref_week_cache[ref_fw] = load_features_week(conn, ref_fw)
+
+    # ── Bad-item SHAP: reuse cache or compute once for all items ─────────────
+    if bad_shap_cache is not None:
+        bad_shap_by_uid = {uid: bad_shap_cache[uid] for uid in item_ref if uid in bad_shap_cache}
+    else:
+        bad_rows = (
+            week_df[week_df['unique_id'].isin(item_ref.keys())]
+            [['unique_id'] + FEATURE_COLS].fillna(0).reset_index(drop=True)
+        )
+        if bad_rows.empty:
+            return []
+        sv_bad_all = explainer.shap_values(bad_rows[FEATURE_COLS])
+        bad_shap_by_uid = {uid: sv_bad_all[i] for i, uid in enumerate(bad_rows['unique_id'])}
+
+    # ── Ref-item SHAP: batch by ref week ─────────────────────────────────────
+    items_by_ref: dict[str, list[str]] = defaultdict(list)
+    for uid, (ref_fw, _) in item_ref.items():
+        items_by_ref[ref_fw].append(uid)
+
+    ref_shap_by_uid: dict[str, np.ndarray] = {}
+    for ref_fw, ref_uids in items_by_ref.items():
+        ref_df = ref_week_cache[ref_fw]
+        ref_items_df = (
+            ref_df[ref_df['unique_id'].isin(ref_uids)]
+            [['unique_id'] + FEATURE_COLS].fillna(0).reset_index(drop=True)
+        )
+        if ref_items_df.empty:
+            continue
+        sv_ref = explainer.shap_values(ref_items_df[FEATURE_COLS])
+        for i, uid in enumerate(ref_items_df['unique_id']):
+            ref_shap_by_uid[uid] = sv_ref[i]
+
+    # ── Build payloads ────────────────────────────────────────────────────────
+    results = []
+    for uid, (ref_fw, good_mape) in item_ref.items():
+        if uid not in bad_shap_by_uid or uid not in ref_shap_by_uid:
             continue
 
-        X_both = pd.concat(
-            [bad_item[FEATURE_COLS].fillna(0), ref_item[FEATURE_COLS].fillna(0)],
-            ignore_index=True,
-        )
-        sv = explainer.shap_values(X_both)
+        bad_item = week_df[week_df['unique_id'] == uid]
+        ref_item = ref_week_cache[ref_fw][ref_week_cache[ref_fw]['unique_id'] == uid]
+        if bad_item.empty or ref_item.empty:
+            continue
+
+        sv_bad = bad_shap_by_uid[uid]
+        sv_ref_item = ref_shap_by_uid[uid]
 
         diffs = sorted(
             [
                 {
                     'feature': FEATURE_COLS[j],
-                    'shap_diff': round(float(sv[0][j] - sv[1][j]), 4),
-                    'bad_value': round(float(X_both.iloc[0, j]), 4),
-                    'good_value': round(float(X_both.iloc[1, j]), 4),
-                    'bad_shap': round(float(sv[0][j]), 4),
-                    'good_shap': round(float(sv[1][j]), 4),
+                    'shap_diff': round(float(sv_bad[j] - sv_ref_item[j]), 4),
+                    'bad_value': round(float(bad_item[FEATURE_COLS].iloc[0, j]), 4),
+                    'good_value': round(float(ref_item[FEATURE_COLS].iloc[0, j]), 4),
+                    'bad_shap': round(float(sv_bad[j]), 4),
+                    'good_shap': round(float(sv_ref_item[j]), 4),
                 }
                 for j in range(len(FEATURE_COLS))
             ],
@@ -178,8 +259,9 @@ def contrastive_payloads(
             'xai_type': 'contrastive',
             'payload': json.dumps({
                 'bad_week': forecast_week,
-                'good_week': ref_forecast_week,
-                'good_week_mape': round(float(ref_row['mape']), 2),
+                'good_week': ref_fw,
+                'good_week_mape': round(good_mape, 2),
+                'seasonality_matched': True,
                 'top_diffs': diffs[:5],
             }),
         })

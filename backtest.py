@@ -122,10 +122,11 @@ def main() -> None:
         top_items  = week_evals.nlargest(TOP_N_XAI, 'mape')['unique_id'].tolist()
         actual_map = dict(zip(week_evals['unique_id'], week_evals['actual']))
 
+        shap_rows, shap_cache = shap_payloads(explainer, model, week_df, forecast_week, top_items, actual_map)
         xai_rows = (
-            shap_payloads(explainer, model, week_df, forecast_week, top_items, actual_map)
+            shap_rows
             + counterfactual_payloads(model, week_df, forecast_week, top_items, actual_map)
-            + contrastive_payloads(explainer, week_df, forecast_week, top_items, all_evals_df, conn)
+            + contrastive_payloads(explainer, week_df, forecast_week, top_items, all_evals_df, conn, shap_cache)
         )
         if xai_rows:
             insert_xai(conn, xai_rows)

@@ -22,3 +22,12 @@ packages = ["xai_forecast"]
 
 [tool.uv]
 constraint-dependencies = ["numba>=0.61"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
