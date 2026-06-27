@@ -39,7 +39,7 @@ Rules:
 - Output valid JSON matching this schema exactly:
   {"headline": "<10-15 word summary>", "body": "<2-3 sentences, plain English, no jargon>", \
 "primary_driver": "<exact feature name from the features list>", "confidence": "<high|medium|low>"}
-- confidence = high if top driver explains >30% of total SHAP mass, medium 15-30%, low otherwise.
+- confidence = high if top driver's pct_of_top_features > 30, medium if 15-30, low otherwise.
 - Never mention "SHAP", "log-margin", or model internals in body — translate to plain English.
 - If lag_1 or lag_2 dominates: say "recent sales trend unexpectedly changed". \
 If snap dominates: say "promotion-week uplift". If price_change_pct: say "pricing change". \
@@ -108,7 +108,7 @@ def build_week_dossier(
 
     total_shap = sum(f['mean_abs_shap'] for f in top_features)
     for f in top_features:
-        f['pct_of_total'] = round(f['mean_abs_shap'] / total_shap * 100, 1) if total_shap > 0 else 0.0
+        f['pct_of_top_features'] = round(f['mean_abs_shap'] / total_shap * 100, 1) if total_shap > 0 else 0.0
 
     return {
         'forecast_week': forecast_week,
@@ -186,7 +186,12 @@ def build_executive_dossier(
 # ── Grounding check ────────────────────────────────────────────────────────────
 
 def _grounding_check(narrative: dict, dossier: dict) -> bool:
-    """Return False if primary_driver is not found in the evidence feature list."""
+    """
+    Structural check: primary_driver must be a feature name present in the evidence.
+    Does NOT validate free-text body content or numbers — low temperature + prompt
+    rules are the main mitigation for those.
+    Returns False (flags for confidence downgrade) if primary_driver is absent or unknown.
+    """
     primary = narrative.get('primary_driver', '')
     if not primary:
         return False

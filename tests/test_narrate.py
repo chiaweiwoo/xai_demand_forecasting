@@ -123,11 +123,11 @@ def test_build_week_dossier_empty_rows():
     assert dossier['wmape_zscore'] is None
 
 
-def test_build_week_dossier_pct_of_total_sums_to_100():
+def test_build_week_dossier_pct_of_top_features_sums_to_100():
     rows = [_shap_row()]
     dossier = build_week_dossier('2015-01-03', rows, wmape_zscore=2.0, n_items_in_week=20)
-    total_pct = sum(f['pct_of_total'] for f in dossier['top_features'])
-    assert abs(total_pct - 100.0) < 1.0, f'pct_of_total should sum to ~100, got {total_pct}'
+    total_pct = sum(f['pct_of_top_features'] for f in dossier['top_features'])
+    assert abs(total_pct - 100.0) < 1.0, f'pct_of_top_features should sum to ~100, got {total_pct}'
 
 
 # ── build_item_dossier ────────────────────────────────────────────────────────
