@@ -181,6 +181,45 @@ def test_compute_recurring_drivers_empty():
     assert compute_recurring_drivers([]) == []
 
 
+def test_compute_recurring_drivers_pct_bad_weeks_same_week():
+    """Two SKUs in the same week → pct_bad_weeks=100 (1 distinct week of 1 total)."""
+    rows = [_shap_row('2015-01-03', 'A'), _shap_row('2015-01-03', 'B')]
+    drivers = compute_recurring_drivers(rows)
+    lag1 = next(d for d in drivers if d['feature'] == 'lag_1')
+    assert lag1['n_weeks'] == 1
+    assert lag1['pct_bad_weeks'] == pytest.approx(100.0, abs=0.1)
+
+
+def test_compute_recurring_drivers_pct_bad_weeks_two_weeks():
+    """Same feature across two distinct weeks → pct_bad_weeks=100; feature only in week1 → 50."""
+    row_w1_a = _shap_row('2015-01-03', 'A')
+    row_w2_a = _shap_row('2015-01-10', 'A')  # same features, different week
+    drivers = compute_recurring_drivers([row_w1_a, row_w2_a])
+    # lag_1 appears in both weeks
+    lag1 = next(d for d in drivers if d['feature'] == 'lag_1')
+    assert lag1['n_weeks'] == 2
+    assert lag1['pct_bad_weeks'] == pytest.approx(100.0, abs=0.1)
+
+
+def test_compute_recurring_drivers_dict_payload():
+    """compute_recurring_drivers must handle pre-parsed dict payloads (not just JSON strings)."""
+    row = {
+        'week_id': '2015-01-03',
+        'item_id': 'A',
+        'xai_type': 'shap',
+        'payload': {  # dict, not a JSON string
+            'top_features': [
+                {'feature': 'lag_1', 'shap_value': 0.8, 'feature_value': 3.0},
+                {'feature': 'snap', 'shap_value': 0.3, 'feature_value': 1.0},
+            ],
+        },
+    }
+    drivers = compute_recurring_drivers([row])
+    features = [d['feature'] for d in drivers]
+    assert 'lag_1' in features
+    assert 'snap' in features
+
+
 # ── build_executive_dossier ───────────────────────────────────────────────────
 
 def test_build_executive_dossier_structure():

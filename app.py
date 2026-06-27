@@ -6,6 +6,7 @@ Usage:
 """
 
 import json
+import sqlite3
 from collections import defaultdict
 
 import numpy as np
@@ -24,6 +25,7 @@ from xai_forecast.db import (
     get_conn, week_summary, load_evaluations, load_xai, load_all_shap_payloads,
     load_narrative,
 )
+from xai_forecast.features import FEATURE_COLS
 from xai_forecast.narrate import compute_recurring_drivers
 
 DB_PATH = 'db/forecasting.db'
@@ -103,7 +105,7 @@ def _week_narrative(week_id: str) -> dict | None:
     try:
         with get_conn(DB_PATH) as conn:
             return load_narrative(conn, 'week', week_id)
-    except Exception:
+    except (sqlite3.OperationalError, json.JSONDecodeError):
         return None
 
 
@@ -111,7 +113,7 @@ def _item_narrative(week_id: str, item_id: str) -> dict | None:
     try:
         with get_conn(DB_PATH) as conn:
             return load_narrative(conn, 'item', f'{week_id}::{item_id}')
-    except Exception:
+    except (sqlite3.OperationalError, json.JSONDecodeError):
         return None
 
 
@@ -120,7 +122,7 @@ def _executive_narrative() -> dict | None:
     try:
         with get_conn(DB_PATH) as conn:
             return load_narrative(conn, 'executive', 'overall')
-    except Exception:
+    except (sqlite3.OperationalError, json.JSONDecodeError):
         return None
 
 
@@ -364,7 +366,7 @@ elif page == 'XAI Explorer':
             base_log = d['base_value_log']
 
             other_shap = d.get('other_features_shap')
-            n_other = 19 - len(feats)
+            n_other = len(FEATURE_COLS) - len(feats)
             if other_shap is not None:
                 labels = labels + [f'other {n_other} features']
                 values = values + [other_shap]

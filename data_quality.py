@@ -87,6 +87,7 @@ def main() -> None:
     bad_weeks_df = pd.read_sql(
         'SELECT DISTINCT week_id FROM evaluations WHERE is_bad_week=1', conn
     )
+    xai_types_ok = True
     if not bad_weeks_df.empty:
         xai_types_df = pd.read_sql(
             'SELECT week_id, xai_type, COUNT(*) AS n FROM xai_results GROUP BY week_id, xai_type',
@@ -101,11 +102,11 @@ def main() -> None:
                 truly_missing = missing - {'contrastive'}
                 if truly_missing:
                     print(f'  {_FAIL}  {week}: missing xai_types {truly_missing}')
-                    all_ok = False
+                    xai_types_ok = False
                 else:
                     print(f'  {_WARN}  {week}: no contrastive data (no same-WOY good week)')
 
-    all_ok &= _check('all bad weeks have shap + counterfactual', all_ok)
+    all_ok &= _check('all bad weeks have shap + counterfactual', xai_types_ok)
 
     # ── Payload JSON validity ─────────────────────────────────────────────────
 

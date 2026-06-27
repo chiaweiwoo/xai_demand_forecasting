@@ -9,6 +9,7 @@ import pytest
 from xai_forecast.db import (
     get_conn,
     insert_forecasts, insert_evaluations, insert_xai,
+    insert_narrative, load_narrative, load_narratives_by_scope,
     load_features_week,
     week_summary,
 )
@@ -125,3 +126,39 @@ def test_week_summary_counts(db_conn):
     assert w1['n_items'] == 2
     assert w1['avg_mape'] == pytest.approx(7.5)
     assert w1['n_bad_items'] == 1
+
+
+# ── Narrative CRUD ────────────────────────────────────────────────────────────
+
+def test_insert_narrative_readback(db_conn):
+    payload = {'headline': 'Test headline', 'body': 'Body text.',
+               'primary_driver': 'lag_1', 'confidence': 'high'}
+    insert_narrative(db_conn, 'week', '2015-01-01', payload, 'deepseek-v4-flash')
+    recovered = load_narrative(db_conn, 'week', '2015-01-01')
+    assert recovered is not None
+    assert recovered['headline'] == 'Test headline'
+    assert recovered['primary_driver'] == 'lag_1'
+
+
+def test_insert_narrative_idempotent(db_conn):
+    """Second INSERT with same (scope, key) must overwrite, not duplicate."""
+    insert_narrative(db_conn, 'week', '2015-02-01', {'headline': 'v1', 'body': '', 'primary_driver': 'snap', 'confidence': 'low'}, 'model-a')
+    insert_narrative(db_conn, 'week', '2015-02-01', {'headline': 'v2', 'body': '', 'primary_driver': 'lag_1', 'confidence': 'high'}, 'model-b')
+    recovered = load_narrative(db_conn, 'week', '2015-02-01')
+    assert recovered['headline'] == 'v2'
+    count = db_conn.execute("SELECT COUNT(*) FROM narratives WHERE scope='week' AND key='2015-02-01'").fetchone()[0]
+    assert count == 1
+
+
+def test_load_narrative_missing_key_returns_none(db_conn):
+    result = load_narrative(db_conn, 'week', 'nonexistent-week')
+    assert result is None
+
+
+def test_load_narratives_by_scope_multi_row(db_conn):
+    insert_narrative(db_conn, 'item', '2015-01-01::A', {'headline': 'Item A', 'body': '', 'primary_driver': 'lag_1', 'confidence': 'medium'}, 'm')
+    insert_narrative(db_conn, 'item', '2015-01-01::B', {'headline': 'Item B', 'body': '', 'primary_driver': 'snap', 'confidence': 'low'}, 'm')
+    result = load_narratives_by_scope(db_conn, 'item')
+    assert '2015-01-01::A' in result
+    assert '2015-01-01::B' in result
+    assert result['2015-01-01::A']['headline'] == 'Item A'

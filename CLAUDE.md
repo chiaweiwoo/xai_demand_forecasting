@@ -142,6 +142,7 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 - Narratives are generated during `backtest.py` (after XAI phase) and cached in the `narratives` table.
 - If `DEEPSEEK_API_KEY` is not set, narratives are skipped silently. Dashboard falls back to charts only.
 - Smoke test includes one live API probe (real call, fails loudly on bad config).
+- `compute_recurring_drivers(shap_rows)`: single source of truth for recurring-driver aggregation. Returns `{feature, count, pct_payloads, n_weeks, pct_bad_weeks}` per feature. `pct_bad_weeks` = % of distinct bad weeks in which this feature appeared as a top-5 driver — used for executive narrative confidence thresholding (high >60%, medium 40–60%, low otherwise).
 
 **Pre-launch SKUs:** A SKU in its pre-launch weeks has all-NaN lag features. `make_forecasts` imputes these to 0 (via `.fillna(0)` before `model.predict`). If such a SKU has `y > 0` in that week, it is evaluated against a garbage forecast. `backtest.py` counts and logs these rows. `data_quality.py` checks for pre-launch price leakage (sell_price non-null with lag_1 null — would indicate the bfill bug returning).
 

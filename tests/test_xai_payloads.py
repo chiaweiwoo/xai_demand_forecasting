@@ -55,7 +55,8 @@ def test_shap_required_keys(shap_result):
     rows, _ = shap_result
     assert len(rows) == 1
     d = json.loads(rows[0]['payload'])
-    for key in ('base_value_log', 'prediction', 'other_features_shap', 'top_features', 'shap_note'):
+    for key in ('base_value_log', 'prediction', 'other_features_shap', 'top_features', 'shap_note',
+                'signed_error', 'direction'):
         assert key in d, f'SHAP payload missing key: {key}'
 
 

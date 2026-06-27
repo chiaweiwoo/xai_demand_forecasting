@@ -355,7 +355,7 @@ def main() -> None:
     # ── Write to throwaway smoke DB ────────────────────────────────
     t = time.perf_counter()
     smoke_conn = get_conn(SMOKE_DB)
-    smoke_conn.executescript('DELETE FROM forecasts; DELETE FROM evaluations; DELETE FROM xai_results;')
+    smoke_conn.executescript('DELETE FROM forecasts; DELETE FROM evaluations; DELETE FROM xai_results; DELETE FROM narratives;')
     smoke_conn.commit()
 
     all_eval_frames = []

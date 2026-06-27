@@ -62,8 +62,9 @@ def shap_payloads(
     shap_cache: dict[str, np.ndarray] = {}
     for i, uid in enumerate(rows['unique_id']):
         shap_cache[uid] = sv[i]
-        top_idx = np.argsort(np.abs(sv[i]))[::-1][:5]
-        other_idx = np.argsort(np.abs(sv[i]))[::-1][5:]
+        sorted_idx = np.argsort(np.abs(sv[i]))[::-1]
+        top_idx = sorted_idx[:5]
+        other_idx = sorted_idx[5:]
         other_shap = float(np.sum(sv[i][other_idx]))
 
         actual = actual_map.get(uid, np.nan)
@@ -77,7 +78,7 @@ def shap_payloads(
                 'actual': round(float(actual), 4) if not np.isnan(actual) else None,
                 'error_pct': round(abs(float(preds[i]) - actual) / actual * 100, 2) if actual > 0 else None,
                 'signed_error': round((float(preds[i]) - actual) / actual * 100, 2) if actual > 0 else None,
-                'direction': ('over' if float(preds[i]) > actual else 'under') if actual >= 0 else None,
+                'direction': ('over' if float(preds[i]) > actual else 'under') if actual > 0 else None,
                 'shap_note': 'values in log-margin space (Tweedie log-link); ranking by |shap| is valid',
                 'other_features_shap': round(other_shap, 4),
                 'top_features': [

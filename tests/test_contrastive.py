@@ -196,14 +196,16 @@ def test_contrastive_cache_vs_fresh_shap(trained_model_and_explainer, db_conn):
     fd, path = tempfile.mkstemp(suffix='.db')
     os.close(fd)
     db_conn2 = get_conn(path)
-    df.to_sql('features', db_conn2, if_exists='append', index=False)
-    db_conn2.commit()
+    try:
+        df.to_sql('features', db_conn2, if_exists='append', index=False)
+        db_conn2.commit()
 
-    results_fresh = contrastive_payloads(
-        explainer, bad_week_df, bad_week, [uid], all_evals, db_conn2
-    )
-    db_conn2.close()
-    os.unlink(path)
+        results_fresh = contrastive_payloads(
+            explainer, bad_week_df, bad_week, [uid], all_evals, db_conn2
+        )
+    finally:
+        db_conn2.close()
+        os.unlink(path)
 
     assert results_cached and results_fresh
     cached_diffs = json.loads(results_cached[0]['payload'])['top_diffs']

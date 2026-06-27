@@ -69,23 +69,23 @@ app.py             Streamlit dashboard (4 pages)
 |---|---|
 | Overview | Weekly MAPE time series with bad-week markers |
 | Bad Week Drilldown | LLM narrative card + worst items table + week-level SHAP aggregation |
-| Recurring Drivers | LLM executive synthesis + feature frequency across all bad weeks |
+| Recurring Drivers | LLM executive synthesis + feature frequency across all bad weeks (% of bad weeks each feature appeared in) |
 | XAI Explorer | LLM item narrative + SHAP waterfall, counterfactual, contrastive |
 
 ## Testing
 
 ```bash
-uv run pytest          # 73 tests, ~4s
+uv run pytest          # ~83 tests, ~4s
 ```
 
 Test groups:
 - **A (features):** lag correctness, rolling leakage, bfill regression, future-invariance
 - **B (evaluate):** WMAPE formula, z-score, NaN propagation, drop-zero-actual
-- **C (XAI payloads):** all dashboard-read keys, SHAP additivity, JSON round-trip
-- **D (DB):** INSERT OR REPLACE idempotency, read-back, clean-slate DELETE
+- **C (XAI payloads):** all dashboard-read keys (incl. signed_error/direction), SHAP additivity, JSON round-trip
+- **D (DB):** INSERT OR REPLACE idempotency, read-back, clean-slate DELETE, narrative CRUD
 - **Contrastive:** same-WOY selection, skip-when-no-match, shap_diff math, cache equality
 - **Correctness regression:** baseline shift(1) property, NaN forecast handling, end-to-end mini-backtest
-- **Narrate:** dossier builders (pure), grounding check, no-key fallback, mocked LLM schema + round-trip
+- **Narrate:** dossier builders (pure), grounding check, no-key fallback, mocked LLM schema + round-trip, pct_bad_weeks metric
 
 ## Stack
 

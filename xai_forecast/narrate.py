@@ -39,11 +39,17 @@ Rules:
 - Output valid JSON matching this schema exactly:
   {"headline": "<10-15 word summary>", "body": "<2-3 sentences, plain English, no jargon>", \
 "primary_driver": "<exact feature name from the features list>", "confidence": "<high|medium|low>"}
-- confidence = high if top driver's pct_of_top_features > 30, medium if 15-30, low otherwise.
+- confidence = high if top driver's pct_of_top_features > 30, medium if 15-30, low otherwise. \
+If n_skus_explained < 3, set confidence to low regardless of pct_of_top_features.
+- If evidence is sparse (n_skus_explained < 3 or top_features is empty), flag this in body: \
+"Limited data this week — interpret with caution."
 - Never mention "SHAP", "log-margin", or model internals in body — translate to plain English.
 - If lag_1 or lag_2 dominates: say "recent sales trend unexpectedly changed". \
 If snap dominates: say "promotion-week uplift". If price_change_pct: say "pricing change". \
-If lag_52 dominates: say "year-over-year seasonality mismatch"."""
+If lag_52 dominates: say "year-over-year seasonality mismatch".
+- Respond in English only.
+- Before writing your final JSON, verify: (1) primary_driver is a name from the features list, \
+(2) body contains no model jargon, (3) all numbers came from the evidence JSON."""
 
 ITEM_NARRATIVE_PROMPT = """\
 You are a retail demand forecasting analyst explaining a specific product's forecast error.
@@ -55,10 +61,14 @@ Rules:
   {"headline": "<10-15 word summary>", "body": "<2-3 sentences, plain English, no jargon>", \
 "primary_driver": "<exact feature name from the features list>", "confidence": "<high|medium|low>"}
 - confidence = high if top SHAP feature has |value| > 0.5, medium 0.2-0.5, low if < 0.2.
-- If contrastive data is present, mention what was structurally different vs the good reference week.
+- If contrastive data is present, mention what was structurally different vs the good reference week. \
+If contrastive data is absent, do not mention comparisons to past weeks.
 - Never mention "SHAP", "log-margin", or model internals in body — translate to plain English.
 - direction field: "over" means model over-forecast (predicted more than actual), \
-"under" means under-forecast."""
+"under" means under-forecast.
+- Respond in English only.
+- Before writing your final JSON, verify: (1) primary_driver is a name from the features list, \
+(2) body contains no model jargon, (3) no past-week comparisons unless contrastive data is present."""
 
 EXECUTIVE_NARRATIVE_PROMPT = """\
 You are a retail demand forecasting analyst presenting findings to a business leader.
@@ -71,8 +81,14 @@ Rules:
   {"headline": "<12-18 word executive summary>", \
 "body": "<3-4 sentences, plain English suitable for a business meeting>", \
 "primary_driver": "<most recurring feature name from the features list>", "confidence": "<high|medium|low>"}
-- confidence = high if top feature appears in >60% of bad weeks, medium 40-60%, low otherwise.
-- Focus on what this means for the business, not for the model's internals."""
+- confidence = high if top feature's pct_bad_weeks > 60, medium if 40-60, low otherwise. \
+Use the pct_bad_weeks field from top_recurring_features — not pct_payloads. \
+If n_bad_weeks < 5, set confidence to low regardless of feature frequency.
+- If n_bad_weeks < 5, note in body that the pattern is based on limited data.
+- Focus on what this means for the business, not for the model's internals.
+- Respond in English only.
+- Before writing your final JSON, verify: (1) primary_driver is a name from the features list, \
+(2) all percentages came from the evidence JSON, (3) body is suitable for a business meeting audience."""
 
 
 # ── Dossier builders (pure — no network) ─────────────────────────────────────
@@ -168,21 +184,35 @@ def build_item_dossier(
 def compute_recurring_drivers(shap_rows: list[dict]) -> list[dict]:
     """
     Count feature appearances across all SHAP payloads.
-    shap_rows: list of xai_results rows (each has a 'payload' JSON string).
-    Returns list[{feature, count, pct_payloads}] sorted by count desc.
+    shap_rows: list of xai_results rows (each has 'week_id' and a 'payload' JSON string or dict).
+    Returns list[{feature, count, pct_payloads, n_weeks, pct_bad_weeks}] sorted by count desc.
     Single source of truth — used by both backtest.py and app.py.
     """
     from collections import defaultdict
     feature_counts: dict[str, int] = defaultdict(int)
+    feature_weeks: dict[str, set] = defaultdict(set)
+    all_weeks: set = set()
     total = len(shap_rows)
     for row in shap_rows:
+        week_id = row.get('week_id', '')
+        if week_id:
+            all_weeks.add(week_id)
         p = json.loads(row['payload']) if isinstance(row.get('payload'), str) else row.get('payload', {})
         for f in p.get('top_features', []):
             feature_counts[f['feature']] += 1
+            if week_id:
+                feature_weeks[f['feature']].add(week_id)
+    n_distinct_weeks = len(all_weeks)
     return sorted(
         [
-            {'feature': feat, 'count': cnt,
-             'pct_payloads': round(cnt / total * 100, 1) if total else 0}
+            {
+                'feature': feat,
+                'count': cnt,
+                'pct_payloads': round(cnt / total * 100, 1) if total else 0,
+                'n_weeks': len(feature_weeks[feat]),
+                'pct_bad_weeks': round(len(feature_weeks[feat]) / n_distinct_weeks * 100, 1)
+                    if n_distinct_weeks else 0,
+            }
             for feat, cnt in feature_counts.items()
         ],
         key=lambda x: x['count'],
@@ -263,7 +293,7 @@ class DeepSeekNarrator:
                     {'role': 'user', 'content': json.dumps(dossier, ensure_ascii=False)},
                 ],
                 temperature=0.2,
-                max_tokens=350,
+                max_tokens=600,
                 response_format={'type': 'json_object'},
                 timeout=30,
             )
