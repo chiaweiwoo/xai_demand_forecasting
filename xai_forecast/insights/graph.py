@@ -4,25 +4,17 @@ LangGraph orchestrator for the insights pipeline.
 Graph shape:
   detect_candidates → fan-out per finding (hypothesis → critic) → fan-in → synthesize
 
-Each finding node:
-  1. Planner chooses which read-tools to call for this finding type
-  2. Calls the read-tools to enrich the evidence pack
-  3. Runs hypothesis (Flash)
-  4. Runs critic (Pro) — rejects overclaim, enforces correlation-only for external signals
-  5. Returns a LedgerRow
-
-All accepted rows are fanned in and fed to a single synthesis call (Flash) that
-produces the two-perspective summary.
+conn and client are captured in node-function closures — they never enter the
+LangGraph state dict, which keeps the state serialisation-safe and avoids
+KeyError when LangGraph passes only the node-output delta to edge routers.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, UTC
-from functools import lru_cache
 from operator import add
-from typing import Annotated, Any
+from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
@@ -40,24 +32,6 @@ from .tools import (
     read_model_metadata,
     read_recurring_drivers,
 )
-
-
-# ── Shared state ──────────────────────────────────────────────────────────────
-
-class RunState(dict):
-    """TypedDict-compatible; keys defined here for documentation."""
-    # conn: sqlite3.Connection           (set by caller — not serialisable)
-    # client: DeepSeekClient             (set by caller)
-    # candidates: list[CandidateFinding]
-    # ledger_rows: list[LedgerRow]       (accumulated via Annotated[..., add])
-    # summary: dict[str, Any]
-
-
-class FindingTaskState(dict):
-    """Per-finding fan-out state."""
-    # conn: sqlite3.Connection
-    # client: DeepSeekClient
-    # finding: CandidateFinding
 
 
 # ── Planner: choose tools per finding type ────────────────────────────────────
@@ -95,7 +69,6 @@ def _enrich_evidence(
                 enriched['model_metadata'] = read_model_metadata(conn)
 
             elif tool_name == 'read_xai_findings':
-                # Sample: top 5 SHAP payloads from the worst bad week
                 bad_weeks = read_bad_weeks(conn)
                 if bad_weeks:
                     worst = sorted(bad_weeks, key=lambda x: x.get('avg_mape') or 0, reverse=True)[0]
@@ -104,7 +77,6 @@ def _enrich_evidence(
                     )[:5]
 
             elif tool_name == 'read_demand_trajectory':
-                # Pull trajectories for the top cliff examples in the finding
                 examples = finding.evidence.get('top_examples', [])[:3]
                 trajectories = []
                 for ex in examples:
@@ -114,7 +86,6 @@ def _enrich_evidence(
                     enriched['demand_trajectories'] = trajectories
 
             elif tool_name == 'read_external_signals':
-                # Pull external signals for each notable week
                 notable = finding.evidence.get('notable_weeks', [])[:5]
                 ext_data = []
                 for n in notable:
@@ -130,121 +101,110 @@ def _enrich_evidence(
     return enriched
 
 
-# ── Graph nodes ───────────────────────────────────────────────────────────────
+# ── Graph builder (factory — closes over conn + client) ───────────────────────
 
-def _detect_candidates(state: RunState) -> dict:
-    conn = state['conn']
-    print('  Running detectors...')
-    candidates = run_all_detectors(conn)
-    print(f'  {len(candidates)} candidate findings')
-    return {'candidates': candidates}
+class _State(TypedDict):
+    candidates:  list
+    ledger_rows: Annotated[list, add]  # fan-in reducer: each review_finding appends its row
+    summary:     dict
 
 
-def _route_findings(state: RunState):
-    """Fan-out: one Send per candidate finding."""
-    candidates = state.get('candidates', [])
-    if not candidates:
-        return 'synthesize'
-    return [
-        Send(
-            'review_finding',
-            {
-                'conn':    state['conn'],
-                'client':  state['client'],
-                'finding': c,
-            },
+def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
+    """Build and compile the StateGraph, capturing conn/client in closures."""
+
+    def detect_candidates(state: dict) -> dict:
+        print('  Running detectors...')
+        candidates = run_all_detectors(conn)
+        print(f'  {len(candidates)} candidate findings')
+        return {'candidates': candidates}
+
+    def route_findings(state: dict):
+        """Fan-out: one Send per candidate finding."""
+        candidates = state.get('candidates', [])
+        if not candidates:
+            return 'synthesize'
+        return [
+            Send('review_finding', {'finding': c})
+            for c in candidates
+        ]
+
+    def review_finding(state: dict) -> dict:
+        """Per-finding node: enrich → hypothesis → critic → LedgerRow."""
+        finding: CandidateFinding = state['finding']
+
+        print(f'  [{finding.finding_type}] enriching evidence...')
+        enriched = _enrich_evidence(conn, finding)
+
+        print(f'  [{finding.finding_type}] running hypothesis (Flash)...')
+        hypothesis = run_hypothesis(client, finding, enriched)
+
+        print(f'  [{finding.finding_type}] running critic (Pro)...')
+        critique = run_critic(client, finding, hypothesis, enriched)
+
+        print(f'  [{finding.finding_type}] status={critique.status} confidence={critique.confidence}')
+
+        row = LedgerRow(
+            finding_id=finding.finding_id,
+            finding_type=finding.finding_type,
+            status=critique.status,
+            confidence=critique.confidence,
+            evidence=enriched,
+            hypothesis={
+                'headline':      hypothesis.headline,
+                'explanation':   json.loads(hypothesis.explanation) if hypothesis.explanation else {},
+                'evidence_refs': hypothesis.evidence_refs,
+            } if critique.status != 'rejected' else None,
+            critic_notes=critique.notes,
         )
-        for c in candidates
-    ]
+        return {'ledger_rows': [row]}
 
+    def synthesize(state: dict) -> dict:
+        """Fan-in: combine accepted findings into the two-perspective summary."""
+        rows = state.get('ledger_rows', [])
 
-def _review_finding(state: FindingTaskState) -> dict:
-    """Per-finding node: enrich → hypothesis → critic → LedgerRow."""
-    conn    = state['conn']
-    client  = state['client']
-    finding = state['finding']
+        accepted = [
+            {
+                'finding_id':   r.finding_id,
+                'finding_type': r.finding_type,
+                'confidence':   r.confidence,
+                'hypothesis':   r.hypothesis,
+                'critic_notes': r.critic_notes,
+            }
+            for r in rows
+            if r.status == 'accepted'
+        ]
 
-    print(f'  [{finding.finding_type}] enriching evidence...')
-    enriched = _enrich_evidence(conn, finding)
+        print(f'  Synthesis: {len(accepted)} accepted / {len(rows)} total findings (Flash)...')
 
-    print(f'  [{finding.finding_type}] running hypothesis (Flash)...')
-    hypothesis = run_hypothesis(client, finding, enriched)
+        if not accepted:
+            summary = {
+                'data_scientist': {
+                    'headline': 'Insufficient evidence for confident findings',
+                    'summary':  'All candidate findings were rejected or flagged for review.',
+                    'top_issues': [],
+                    'recommended_actions': ['Collect more backtest weeks before re-running insights'],
+                },
+                'business_leader': {
+                    'headline': 'Analysis inconclusive — more data needed',
+                    'summary':  'The automated review could not confirm specific failure patterns.',
+                    'risk_direction': 'mixed',
+                    'limitations': ['Insufficient data for confident conclusions'],
+                    'improvement_plan': 'Extend the backtest period and re-run the insights analysis.',
+                },
+                'overall_confidence': 'low',
+            }
+        else:
+            summary = run_synthesis(client, accepted)
 
-    print(f'  [{finding.finding_type}] running critic (Pro)...')
-    critique = run_critic(client, finding, hypothesis, enriched)
+        return {'summary': summary}
 
-    print(f'  [{finding.finding_type}] status={critique.status} confidence={critique.confidence}')
-
-    row = LedgerRow(
-        finding_id=finding.finding_id,
-        finding_type=finding.finding_type,
-        status=critique.status,
-        confidence=critique.confidence,
-        evidence=enriched,
-        hypothesis={
-            'headline':     hypothesis.headline,
-            'explanation':  json.loads(hypothesis.explanation) if hypothesis.explanation else {},
-            'evidence_refs': hypothesis.evidence_refs,
-        } if critique.status != 'rejected' else None,
-        critic_notes=critique.notes,
-    )
-    return {'ledger_rows': [row]}
-
-
-def _synthesize(state: RunState) -> dict:
-    """Fan-in: combine accepted findings into the two-perspective summary."""
-    client = state['client']
-    rows   = state.get('ledger_rows', [])
-
-    accepted = [
-        {
-            'finding_id':   r.finding_id,
-            'finding_type': r.finding_type,
-            'confidence':   r.confidence,
-            'hypothesis':   r.hypothesis,
-            'critic_notes': r.critic_notes,
-        }
-        for r in rows
-        if r.status == 'accepted'
-    ]
-
-    print(f'  Synthesis: {len(accepted)} accepted / {len(rows)} total findings (Flash)...')
-
-    if not accepted:
-        summary = {
-            'data_scientist': {
-                'headline': 'Insufficient evidence for confident findings',
-                'summary':  'All candidate findings were rejected or flagged for review. Re-run after more backtest data is available.',
-                'top_issues': [],
-                'recommended_actions': ['Collect more backtest weeks before re-running insights'],
-            },
-            'business_leader': {
-                'headline': 'Analysis inconclusive — more data needed',
-                'summary':  'The automated review could not confirm specific failure patterns with sufficient confidence.',
-                'risk_direction': 'mixed',
-                'limitations': ['Insufficient data for confident conclusions'],
-                'improvement_plan': 'Extend the backtest period and re-run the insights analysis.',
-            },
-            'overall_confidence': 'low',
-        }
-    else:
-        summary = run_synthesis(client, accepted)
-
-    return {'summary': summary}
-
-
-# ── Graph builder ─────────────────────────────────────────────────────────────
-
-@lru_cache(maxsize=1)
-def _build_graph():
-    builder = StateGraph(dict)
-
-    builder.add_node('detect_candidates', _detect_candidates)
-    builder.add_node('review_finding',    _review_finding)
-    builder.add_node('synthesize',        _synthesize)
+    builder = StateGraph(_State)
+    builder.add_node('detect_candidates', detect_candidates)
+    builder.add_node('review_finding',    review_finding)
+    builder.add_node('synthesize',        synthesize)
 
     builder.add_edge(START, 'detect_candidates')
-    builder.add_conditional_edges('detect_candidates', _route_findings)
+    builder.add_conditional_edges('detect_candidates', route_findings)
     builder.add_edge('review_finding', 'synthesize')
     builder.add_edge('synthesize', END)
 
@@ -260,15 +220,12 @@ def run_insights_graph(
     ledger_rows includes all findings (accepted + rejected + needs_review).
     summary_dict is the two-perspective synthesis.
     """
-    graph = _build_graph()
+    graph = _build_graph(conn, client)
     result = graph.invoke(
         {
-            'conn':         conn,
-            'client':       client,
-            'candidates':   [],
-            'ledger_rows':  [],
-            'summary':      {},
+            'candidates':  [],
+            'ledger_rows': [],
+            'summary':     {},
         },
-        config={'max_concurrency': 3},
     )
     return result.get('ledger_rows', []), result.get('summary', {})
