@@ -149,6 +149,29 @@ def main() -> None:
         f'{n_prelaunch_with_price} suspicious rows'
     )
 
+    # ── External signals (Stage 2) ───────────────────────────────────────────
+    n_ext = conn.execute('SELECT COUNT(*) FROM external_signals').fetchone()[0]
+    if n_ext == 0:
+        print(f'  {_WARN}  external_signals table is empty (run: uv run python ingest_external.py)')
+    else:
+        all_ok &= _check('external_signals row count == 278 fiscal weeks', n_ext == 278,
+                         f'{n_ext} rows')
+        for col in ['temp_mean', 'temp_max', 'temp_min', 'precip', 'heat_days',
+                    'gas_price', 'consumer_sentiment']:
+            n_null = conn.execute(
+                f'SELECT COUNT(*) FROM external_signals WHERE {col} IS NULL'
+            ).fetchone()[0]
+            all_ok &= _check(f'external_signals.{col} has no nulls', n_null == 0,
+                             f'{n_null} nulls')
+        # All evaluation weeks must be covered by external_signals
+        uncovered = conn.execute(
+            'SELECT COUNT(DISTINCT e.week_id) FROM evaluations e '
+            'LEFT JOIN external_signals x ON x.week = e.week_id '
+            'WHERE x.week IS NULL'
+        ).fetchone()[0]
+        all_ok &= _check('All eval weeks covered by external_signals', uncovered == 0,
+                         f'{uncovered} weeks missing')
+
     conn.close()
 
     print('\n' + '-' * 50)
