@@ -24,9 +24,9 @@ except ImportError:
     _OpenAI = None  # type: ignore[assignment,misc]
     _OPENAI_AVAILABLE = False
 
-# Generous cap: worst-case schema output is ~200 tokens; 800 leaves a 4× margin.
-# Raise this value (never lower it) if finish_reason='length' warnings appear in logs.
-MAX_NARRATIVE_TOKENS = 800
+# DeepSeek V4 Flash generates ~800 tokens on verbose week dossiers (observed in production).
+# 2000 leaves a comfortable margin. Never lower this value.
+MAX_NARRATIVE_TOKENS = 2000
 
 
 # ── Prompt constants ──────────────────────────────────────────────────────────
