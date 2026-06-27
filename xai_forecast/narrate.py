@@ -24,6 +24,10 @@ except ImportError:
     _OpenAI = None  # type: ignore[assignment,misc]
     _OPENAI_AVAILABLE = False
 
+# Generous cap: worst-case schema output is ~200 tokens; 800 leaves a 4× margin.
+# Raise this value (never lower it) if finish_reason='length' warnings appear in logs.
+MAX_NARRATIVE_TOKENS = 800
+
 
 # ── Prompt constants ──────────────────────────────────────────────────────────
 # NOTE: These are *_PROMPT constants. Per project rules, run /prompt-audit
@@ -293,11 +297,19 @@ class DeepSeekNarrator:
                     {'role': 'user', 'content': json.dumps(dossier, ensure_ascii=False)},
                 ],
                 temperature=0.2,
-                max_tokens=600,
+                max_tokens=MAX_NARRATIVE_TOKENS,
                 response_format={'type': 'json_object'},
                 timeout=30,
             )
-            raw = resp.choices[0].message.content
+            choice = resp.choices[0]
+            if choice.finish_reason == 'length':
+                logger.warning(
+                    'Narrative truncated at max_tokens=%d (finish_reason=length). '
+                    'Increase MAX_NARRATIVE_TOKENS in narrate.py.',
+                    MAX_NARRATIVE_TOKENS,
+                )
+                return None
+            raw = choice.message.content
             result: dict = json.loads(raw)
 
             for required_key in ('headline', 'body', 'primary_driver', 'confidence'):

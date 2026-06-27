@@ -366,3 +366,21 @@ def test_generate_payload_json_round_trip():
     recovered = json.loads(stored)
     assert recovered['primary_driver'] == 'snap'
     assert recovered['confidence'] == 'medium'
+
+
+def test_generate_returns_none_on_truncation():
+    """finish_reason='length' must return None rather than attempting to parse truncated JSON."""
+    narrator = DeepSeekNarrator.__new__(DeepSeekNarrator)
+    narrator._key = 'test-key'
+    narrator.model_id = 'deepseek-v4-flash'
+    narrator._base_url = 'https://api.deepseek.com'
+    mock_client = MagicMock()
+    mock_choice = MagicMock(
+        finish_reason='length',
+        message=MagicMock(content='{"headline": "trunc'),  # truncated — invalid JSON
+    )
+    mock_client.chat.completions.create.return_value.choices = [mock_choice]
+    narrator._client = mock_client
+
+    result = narrator.generate(WEEK_NARRATIVE_PROMPT, {'features': ['lag_1']})
+    assert result is None
