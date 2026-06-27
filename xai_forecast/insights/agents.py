@@ -13,10 +13,13 @@ Each function is a pure LLM call: takes evidence/text, returns a dict.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from .llm_client import DeepSeekClient
 from .schemas import CandidateFinding, Hypothesis, Critique
+
+log = logging.getLogger(__name__)
 
 # ── Prompt constants ──────────────────────────────────────────────────────────
 # NOTE: These are *_PROMPT constants. Per project rules, run /prompt-audit
@@ -159,15 +162,17 @@ def run_planner(
         'summary': finding.summary,
         'evidence_keys_available': list(finding.evidence.keys()),
     }
+    log.debug('PLANNER input: finding_type=%s score=%.2f evidence_keys=%s',
+              finding.finding_type, finding.score, list(finding.evidence.keys()))
     result = client.call_flash(PLANNER_PROMPT, payload)
+    log.debug('PLANNER raw response: %s', result)
     chosen = result.get('tools', [])
     rationale = result.get('rationale', '')
-    # Validate — only accept known tool names
     valid = [t for t in chosen if t in _VALID_TOOLS]
     if not valid:
-        # Fallback to a safe default so the pipeline never stalls
+        log.warning('PLANNER returned no valid tools, falling back to defaults')
         valid = ['read_forecast_accuracy', 'read_recurring_drivers']
-    print(f'    planner chose {valid} — {rationale}')
+    log.info('PLANNER [%s] → %s | %s', finding.finding_type, valid, rationale)
     return valid
 
 
@@ -183,8 +188,10 @@ def run_hypothesis(
         'score': finding.score,
         'evidence': enriched_evidence,
     }
+    log.debug('HYPOTHESIS input keys: %s', list(enriched_evidence.keys()))
     result = client.call_flash(HYPOTHESIS_PROMPT, payload)
-    return Hypothesis(
+    log.debug('HYPOTHESIS raw response: %s', {k: v for k, v in result.items() if k != 'evidence'})
+    hyp = Hypothesis(
         finding_id=finding.finding_id,
         headline=result.get('headline', ''),
         explanation=json.dumps({
@@ -195,6 +202,9 @@ def run_hypothesis(
         evidence_refs=result.get('evidence_refs', []),
         confidence=result.get('confidence', 'low'),
     )
+    log.info('HYPOTHESIS [%s] headline=%r confidence=%s refs=%s',
+             finding.finding_type, hyp.headline, hyp.confidence, hyp.evidence_refs)
+    return hyp
 
 
 def run_critic(
@@ -215,8 +225,10 @@ def run_critic(
             'confidence':    hypothesis.confidence,
         },
     }
+    log.debug('CRITIC input: headline=%r confidence=%s', hypothesis.headline, hypothesis.confidence)
     result = client.call_pro(CRITIC_PROMPT, payload)
-    return Critique(
+    log.debug('CRITIC raw response: %s', result)
+    critique = Critique(
         finding_id=finding.finding_id,
         status=result.get('status', 'needs_review'),
         confidence=result.get('confidence', 'low'),
@@ -224,6 +236,10 @@ def run_critic(
         overclaim=bool(result.get('overclaim', False)),
         causal_external=bool(result.get('causal_external', False)),
     )
+    log.info('CRITIC [%s] status=%s confidence=%s overclaim=%s causal_external=%s notes=%r',
+             finding.finding_type, critique.status, critique.confidence,
+             critique.overclaim, critique.causal_external, critique.notes[:120])
+    return critique
 
 
 def run_synthesis(
@@ -235,4 +251,9 @@ def run_synthesis(
         'n_accepted_findings': len(accepted_findings),
         'findings': accepted_findings,
     }
-    return client.call_flash(SYNTHESIS_PROMPT, payload)
+    log.debug('SYNTHESIS input: %d accepted findings', len(accepted_findings))
+    result = client.call_flash(SYNTHESIS_PROMPT, payload)
+    log.info('SYNTHESIS overall_confidence=%s', result.get('overall_confidence'))
+    log.debug('SYNTHESIS DS headline: %s', result.get('data_scientist', {}).get('headline'))
+    log.debug('SYNTHESIS Biz headline: %s', result.get('business_leader', {}).get('headline'))
+    return result

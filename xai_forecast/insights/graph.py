@@ -12,9 +12,12 @@ KeyError when LangGraph passes only the node-output delta to edge routers.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from operator import add
 from typing import Annotated, Any, TypedDict
+
+log = logging.getLogger(__name__)
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
@@ -114,16 +117,20 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
     """Build and compile the StateGraph, capturing conn/client in closures."""
 
     def detect_candidates(state: dict) -> dict:
-        print('  Running detectors...')
+        log.info('Running detectors...')
         candidates = run_all_detectors(conn)
-        print(f'  {len(candidates)} candidate findings')
+        log.info('%d candidate findings', len(candidates))
+        for c in candidates:
+            log.debug('  candidate: %s score=%.2f — %s', c.finding_type, c.score, c.summary)
         return {'candidates': candidates}
 
     def route_findings(state: dict):
         """Fan-out: one Send per candidate finding."""
         candidates = state.get('candidates', [])
         if not candidates:
+            log.info('No candidates — jumping to synthesize')
             return 'synthesize'
+        log.info('Routing %d findings for review', len(candidates))
         return [
             Send('review_finding', {'finding': c})
             for c in candidates
@@ -132,28 +139,34 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
     def review_finding(state: dict) -> dict:
         """Per-finding node: plan → enrich → hypothesis → grounding check → critic → LedgerRow."""
         finding: CandidateFinding = state['finding']
+        ft = finding.finding_type
 
-        print(f'  [{finding.finding_type}] planning evidence gathering (Flash)...')
+        log.info('[%s] planning evidence gathering (Flash)...', ft)
         tools_to_run = run_planner(client, finding)
+        log.info('[%s] planner chose: %s', ft, tools_to_run)
 
-        print(f'  [{finding.finding_type}] enriching evidence...')
+        log.info('[%s] enriching evidence with %d tools...', ft, len(tools_to_run))
         enriched = _enrich_evidence(conn, finding, tools_to_run)
+        log.debug('[%s] enriched evidence keys: %s', ft, list(enriched.keys()))
 
-        print(f'  [{finding.finding_type}] running hypothesis (Flash)...')
+        log.info('[%s] running hypothesis (Flash)...', ft)
         hypothesis = run_hypothesis(client, finding, enriched)
+        log.info('[%s] hypothesis: headline=%r confidence=%s', ft, hypothesis.headline, hypothesis.confidence)
+        log.debug('[%s] hypothesis evidence_refs: %s', ft, hypothesis.evidence_refs)
 
         # Deterministic grounding check: verify evidence_refs point to real evidence keys.
-        # If Flash cited keys that don't exist, downgrade confidence before the critic sees it.
         if hypothesis.evidence_refs:
             evidence_keys = set(_flatten_keys(enriched))
             missing = [r for r in hypothesis.evidence_refs if r not in evidence_keys]
             if missing:
-                print(f'  [{finding.finding_type}] grounding FAIL — refs not in evidence: {missing}')
+                log.warning('[%s] GROUNDING FAIL — refs not in evidence: %s', ft, missing)
                 hypothesis.confidence = 'low'
+            else:
+                log.debug('[%s] grounding OK — all %d refs found', ft, len(hypothesis.evidence_refs))
 
-        # Skip Pro critic for low-confidence hypotheses — they go straight to needs_review.
+        # Skip Pro critic for low-confidence hypotheses.
         if hypothesis.confidence == 'low':
-            print(f'  [{finding.finding_type}] skipping critic (confidence=low → needs_review)')
+            log.info('[%s] skipping critic (confidence=low → needs_review)', ft)
             from xai_forecast.insights.schemas import Critique
             critique = Critique(
                 finding_id=finding.finding_id,
@@ -164,10 +177,13 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
                 causal_external=False,
             )
         else:
-            print(f'  [{finding.finding_type}] running critic (Pro)...')
+            log.info('[%s] running critic (Pro)...', ft)
             critique = run_critic(client, finding, hypothesis, enriched)
+            log.info('[%s] critic: status=%s confidence=%s overclaim=%s causal_external=%s',
+                     ft, critique.status, critique.confidence, critique.overclaim, critique.causal_external)
+            log.debug('[%s] critic notes: %s', ft, critique.notes)
 
-        print(f'  [{finding.finding_type}] status={critique.status} confidence={critique.confidence}')
+        log.info('[%s] RESULT: status=%s confidence=%s', ft, critique.status, critique.confidence)
 
         row = LedgerRow(
             finding_id=finding.finding_id,
@@ -200,9 +216,10 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
             if r.status == 'accepted'
         ]
 
-        print(f'  Synthesis: {len(accepted)} accepted / {len(rows)} total findings (Flash)...')
+        log.info('Synthesis: %d accepted / %d total (Flash)...', len(accepted), len(rows))
 
         if not accepted:
+            log.warning('No accepted findings — returning inconclusive summary')
             summary = {
                 'data_scientist': {
                     'headline': 'Insufficient evidence for confident findings',
@@ -221,6 +238,9 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
             }
         else:
             summary = run_synthesis(client, accepted)
+            log.info('Synthesis complete: overall_confidence=%s', summary.get('overall_confidence'))
+            log.debug('DS headline: %s', summary.get('data_scientist', {}).get('headline'))
+            log.debug('Biz headline: %s', summary.get('business_leader', {}).get('headline'))
 
         return {'summary': summary}
 
