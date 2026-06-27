@@ -4,9 +4,9 @@ Sliding-window backtest: forecast + evaluate only.
 Run ingest.py and build_features.py first.
 
 Outputs:
-  db/forecasting.db       → forecasts, evaluations tables
-  models/checkpoint_*.lgbm → one LightGBM checkpoint per retrain cutoff
-  db/week_to_cutoff.json  → maps forecast_week → retrain cutoff (needed by run_xai.py)
+  db/forecasting.db       -> forecasts, evaluations tables
+  models/checkpoint_*.lgbm -> one LightGBM checkpoint per retrain cutoff
+  db/week_to_cutoff.json  -> maps forecast_week -> retrain cutoff (needed by run_xai.py)
 
 Next steps:
   uv run python run_xai.py           # SHAP / counterfactual / contrastive
@@ -106,7 +106,7 @@ def main() -> None:
         all_evals.append(eval_df)
 
     if n_nan_imputed > 0:
-        print(f'\n  Note: {n_nan_imputed:,} pre-launch SKU-week rows had all-NaN features → imputed to 0.')
+        print(f'\n  Note: {n_nan_imputed:,} pre-launch SKU-week rows had all-NaN features -> imputed to 0.')
 
     print('\nFlagging bad weeks (WMAPE z-score, prior-weeks-only baseline)...')
     all_evals_df = pd.concat(all_evals, ignore_index=True)
@@ -125,12 +125,12 @@ def main() -> None:
     ])
     print(f'  {len(bad_weeks)} bad weeks out of {len(backtest_weeks)}')
 
-    # Save week→cutoff mapping so run_xai.py knows which checkpoint to use per forecast week.
+    # Save week->cutoff mapping so run_xai.py knows which checkpoint to use per forecast week.
     cutoff_path = Path('db/week_to_cutoff.json')
     cutoff_path.parent.mkdir(parents=True, exist_ok=True)
     cutoff_path.write_text(json.dumps(week_to_cutoff))
-    print(f'  Saved {len(week_to_cutoff)} week→cutoff mappings → {cutoff_path}')
-    print(f'  Saved {len(list(MODELS_DIR.glob("*.lgbm")))} checkpoint models → {MODELS_DIR}/')
+    print(f'  Saved {len(week_to_cutoff)} week->cutoff mappings -> {cutoff_path}')
+    print(f'  Saved {len(list(MODELS_DIR.glob("*.lgbm")))} checkpoint models -> {MODELS_DIR}/')
 
     conn.close()
     print(f'\nDone -> {DB_PATH}')
