@@ -34,7 +34,7 @@ def main() -> None:
     conn = get_conn(DB_PATH)
     all_ok = True
 
-    print('\nData quality checks\n' + '─' * 50)
+    print('\nData quality checks\n' + '-' * 50)
 
     # ── Forecasts ────────────────────────────────────────────────────────────
 
@@ -59,7 +59,7 @@ def main() -> None:
         'LEFT JOIN forecasts f ON f.week_id = e.week_id '
         'WHERE f.week_id IS NULL'
     ).fetchone()[0]
-    all_ok &= _check('evaluations.week_id ⊆ forecasts.week_id', orphan_weeks == 0,
+    all_ok &= _check('evaluations.week_id subset of forecasts.week_id', orphan_weeks == 0,
                      f'{orphan_weeks} orphan weeks')
 
     n_bad_weeks = conn.execute(
@@ -80,7 +80,7 @@ def main() -> None:
         'LEFT JOIN (SELECT DISTINCT week_id FROM evaluations WHERE is_bad_week=1) b '
         'ON b.week_id = x.week_id WHERE b.week_id IS NULL'
     ).fetchone()[0]
-    all_ok &= _check('xai_results.week_id ⊆ bad weeks', xai_non_bad == 0,
+    all_ok &= _check('xai_results.week_id subset of bad weeks', xai_non_bad == 0,
                      f'{xai_non_bad} non-bad-week XAI rows')
 
     # Each bad week should have all 3 xai_types (shap, counterfactual, contrastive)
@@ -134,20 +134,24 @@ def main() -> None:
         # Not hard-failing this — it could be a rebuild after data reload
 
     # ── Pre-launch price leakage (bfill regression) ───────────────────────────
-    # Rows where sell_price IS NOT NULL but lag_1 IS NULL indicate a pre-launch row
-    # that somehow received a price via backward fill.
+    # Rows where sell_price IS NOT NULL but lag_1 IS NULL (and it's NOT the first
+    # dataset week) indicate a pre-launch row that received a price via backward fill.
+    # Week 1 is excluded: lag_1 is always NULL there (shift(1) returns NaN for the
+    # first row), and a non-null price in week 1 is genuine raw data, not leakage.
+    first_week = conn.execute('SELECT MIN(week) FROM features').fetchone()[0]
     n_prelaunch_with_price = conn.execute(
-        'SELECT COUNT(*) FROM features WHERE sell_price IS NOT NULL AND lag_1 IS NULL'
+        'SELECT COUNT(*) FROM features WHERE sell_price IS NOT NULL AND lag_1 IS NULL AND week != ?',
+        (first_week,),
     ).fetchone()[0]
     all_ok &= _check(
-        'No pre-launch price leakage (sell_price non-null with lag_1 null)',
+        'No pre-launch price leakage (sell_price non-null with lag_1 null, excl. week 1)',
         n_prelaunch_with_price == 0,
         f'{n_prelaunch_with_price} suspicious rows'
     )
 
     conn.close()
 
-    print('\n' + '─' * 50)
+    print('\n' + '-' * 50)
     if all_ok:
         print(f'{_PASS} All checks passed.')
     else:

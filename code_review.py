@@ -690,7 +690,7 @@ elif section == '🗄️  Storage':
                     'LLM narratives (scope, key) with model + created_at',
                 ],
             },
-            use_container_width=True,
+            width="stretch",
         )
 
     with tab3:
