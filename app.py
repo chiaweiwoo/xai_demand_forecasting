@@ -141,7 +141,7 @@ elif page == 'XAI Explorer':
         st.stop()
 
     col1, col2 = st.columns(2)
-    selected_week = col1.selectbox('Bad week (cutoff)', bad_weeks)
+    selected_week = col1.selectbox('Bad week', bad_weeks)
     week_items = evals[evals['week_id'] == selected_week].sort_values('h1_mape', ascending=False)
     selected_item = col2.selectbox('Item (sorted by MAPE ↓)', week_items['item_id'].tolist())
 
@@ -168,25 +168,28 @@ elif page == 'XAI Explorer':
             feats = d['top_features']
             labels = [f"{f['feature']} = {f['feature_value']:.2f}" for f in feats]
             values = [f['shap_value'] for f in feats]
+            base_log = d['base_value_log']
 
             fig = go.Figure(go.Waterfall(
                 orientation='h',
                 measure=['relative'] * len(feats) + ['total'],
-                y=labels + ['final prediction'],
+                y=labels + ['log-margin total'],
                 x=values + [0],
-                base=d['base_value'],
+                base=base_log,
                 connector={'line': {'color': '#ccc'}},
                 increasing={'marker': {'color': 'tomato'}},
                 decreasing={'marker': {'color': 'steelblue'}},
             ))
             fig.update_layout(
-                title='SHAP waterfall — top 5 features driving the prediction',
+                title='SHAP waterfall — top 5 features (log-margin contributions)',
+                xaxis_title='Log-margin contribution',
                 height=340, margin=dict(l=200),
             )
             st.plotly_chart(fig, use_container_width=True)
             st.caption(
-                f"Base value (average prediction): {d['base_value']:.2f}. "
-                'Red bars push the prediction up, blue push it down.'
+                f"Base log-margin: {base_log:.3f} (= log of average prediction). "
+                'SHAP values are additive in log space (Tweedie log-link). '
+                'Red bars push the log-prediction up, blue push it down.'
             )
 
     # ── Counterfactual ───────────────────────────────────────────────────────

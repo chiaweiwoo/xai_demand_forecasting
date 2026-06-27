@@ -102,7 +102,7 @@ def main() -> None:
         {'week_id': r['forecast_week'], 'item_id': r['unique_id'],
          'h1_mape': r['mape'], 'h1_mae': r['mae'],
          'is_bad_week': int(is_bad_map.get(r['forecast_week'], False)),
-         'mape_zscore': float(zscore_map.get(r['forecast_week'], 0) or 0)}
+         'mape_zscore': float(z) if pd.notna(z := zscore_map.get(r['forecast_week'], 0)) else 0.0}
         for r in all_evals_df.to_dict('records')
     ])
     print(f'  {len(bad_weeks)} bad weeks out of {len(backtest_weeks)}')
