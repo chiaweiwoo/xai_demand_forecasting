@@ -101,6 +101,19 @@ def _enrich_evidence(
     return enriched
 
 
+def _flatten_keys(d: dict, prefix: str = '') -> list[str]:
+    """Return all dot-path keys in a nested dict, e.g. 'forecast_accuracy.n_bad_weeks'."""
+    keys = []
+    for k, v in d.items():
+        full = f'{prefix}.{k}' if prefix else k
+        keys.append(full)
+        if isinstance(v, dict):
+            keys.extend(_flatten_keys(v, full))
+        elif isinstance(v, list) and v and isinstance(v[0], dict):
+            keys.extend(_flatten_keys(v[0], f'{full}.0'))
+    return keys
+
+
 # ── Graph builder (factory — closes over conn + client) ───────────────────────
 
 class _State(TypedDict):
@@ -129,7 +142,7 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
         ]
 
     def review_finding(state: dict) -> dict:
-        """Per-finding node: enrich → hypothesis → critic → LedgerRow."""
+        """Per-finding node: enrich → hypothesis → grounding check → critic → LedgerRow."""
         finding: CandidateFinding = state['finding']
 
         print(f'  [{finding.finding_type}] enriching evidence...')
@@ -138,8 +151,30 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
         print(f'  [{finding.finding_type}] running hypothesis (Flash)...')
         hypothesis = run_hypothesis(client, finding, enriched)
 
-        print(f'  [{finding.finding_type}] running critic (Pro)...')
-        critique = run_critic(client, finding, hypothesis, enriched)
+        # Deterministic grounding check: verify evidence_refs point to real evidence keys.
+        # If Flash cited keys that don't exist, downgrade confidence before the critic sees it.
+        if hypothesis.evidence_refs:
+            evidence_keys = set(_flatten_keys(enriched))
+            missing = [r for r in hypothesis.evidence_refs if r not in evidence_keys]
+            if missing:
+                print(f'  [{finding.finding_type}] grounding FAIL — refs not in evidence: {missing}')
+                hypothesis.confidence = 'low'
+
+        # Skip Pro critic for low-confidence hypotheses — they go straight to needs_review.
+        if hypothesis.confidence == 'low':
+            print(f'  [{finding.finding_type}] skipping critic (confidence=low → needs_review)')
+            from xai_forecast.insights.schemas import Critique
+            critique = Critique(
+                finding_id=finding.finding_id,
+                status='needs_review',
+                confidence='low',
+                notes='Skipped Pro critic: hypothesis confidence was low (thin evidence or grounding failure).',
+                overclaim=False,
+                causal_external=False,
+            )
+        else:
+            print(f'  [{finding.finding_type}] running critic (Pro)...')
+            critique = run_critic(client, finding, hypothesis, enriched)
 
         print(f'  [{finding.finding_type}] status={critique.status} confidence={critique.confidence}')
 
