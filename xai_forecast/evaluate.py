@@ -40,8 +40,11 @@ def flag_bad_weeks(
         .sort_values('forecast_week')
     )
     wk['wmape']        = wk['total_mae'] / wk['total_actual'].clip(lower=1) * 100
-    wk['rolling_mean'] = wk['wmape'].rolling(window, min_periods=3).mean()
-    wk['rolling_std']  = wk['wmape'].rolling(window, min_periods=3).std().clip(lower=0.01)
+    # shift(1) so each week is scored against the *prior* 8 weeks only.
+    # Without shift, the current week's own WMAPE inflates the baseline, dampening its z-score.
+    prior = wk['wmape'].shift(1)
+    wk['rolling_mean'] = prior.rolling(window, min_periods=3).mean()
+    wk['rolling_std']  = prior.rolling(window, min_periods=3).std().clip(lower=0.01)
     wk['zscore']       = (wk['wmape'] - wk['rolling_mean']) / wk['rolling_std']
     wk['is_bad_week']  = wk['zscore'] >= z_threshold
     return wk[['forecast_week', 'wmape', 'zscore', 'is_bad_week']]

@@ -1,26 +1,22 @@
 """
-Full backtesting simulation. Run ingest.py first.
+Full backtesting simulation. Run ingest.py and build_features.py first.
 
 Usage:
     uv run python backtest.py
 
 At each iteration: load precomputed features from the feature store -> train -> forecast.
-Requires build_features.py to have run first.
+Each retrain checkpoint is kept in memory so XAI explanations come from the same model
+that produced each week's forecast (at 4-week retrain granularity).
 
 Week key convention: all tables (forecasts, evaluations, xai_results) are keyed on
 forecast_week -- the week the failure was observed, not the training cutoff. This is
 the natural "week X" a leader would point at.
-
-XAI model note: SHAP and counterfactuals are computed with a model retrained on the
-most recent 3-year window, not the model that produced each week's forecast. For a
-portfolio of 125 weeks this is a necessary tradeoff -- the explanations reflect the
-model's learned feature relationships, which are stable, but strictly they come from
-a different model instance than the one that originally erred.
 """
 
 from datetime import datetime
 from tqdm import tqdm
 import pandas as pd
+import lightgbm as lgb
 
 from xai_forecast.db import (
     get_conn, get_all_weeks,
@@ -63,19 +59,33 @@ def main() -> None:
     conn.executescript('DELETE FROM forecasts; DELETE FROM evaluations; DELETE FROM xai_results;')
     conn.commit()
 
-    model = None
+    model: lgb.LGBMRegressor | None = None
     all_evals: list[pd.DataFrame] = []
+    # Per-checkpoint model store: retrain_cutoff → model
+    # Allows XAI to use the exact model that produced each week's forecast.
+    all_models: dict[str, lgb.LGBMRegressor] = {}
+    week_to_cutoff: dict[str, str] = {}  # forecast_week → retrain cutoff used
+    last_retrain_cutoff: str | None = None
+    n_nan_imputed = 0  # pre-launch SKUs forecasted from all-zero features
 
     for i, cutoff in enumerate(tqdm(backtest_weeks, desc='Backtesting')):
         step = TRAIN_WINDOW + i
         forecast_week = weeks[step + 1]
 
         if i % RETRAIN_FREQ == 0:
+            last_retrain_cutoff = cutoff
             window_start = weeks[step - TRAIN_WINDOW]
             train_df     = load_features_window(conn, window_start, cutoff).dropna(subset=FEATURE_COLS)
             model        = train_model(train_df)
+            all_models[last_retrain_cutoff] = model
 
+        week_to_cutoff[forecast_week] = last_retrain_cutoff
         week_df = load_features_week(conn, forecast_week)
+
+        # Count pre-launch SKUs (all lag features NaN → imputed to 0 by make_forecasts)
+        n_nan_rows = int((week_df[FEATURE_COLS].isnull().all(axis=1)).sum())
+        n_nan_imputed += n_nan_rows
+
         preds     = make_forecasts(model, week_df, forecast_week)
 
         # Store under forecast_week -- the week the failure was observed
@@ -90,7 +100,11 @@ def main() -> None:
         eval_df['forecast_week'] = forecast_week
         all_evals.append(eval_df)
 
-    print('\nFlagging bad weeks (WMAPE-based)...')
+    if n_nan_imputed > 0:
+        print(f'\n  Note: {n_nan_imputed:,} pre-launch SKU-week rows had all-NaN features → '
+              f'imputed to 0 by make_forecasts. These are scored against actual if y>0.')
+
+    print('\nFlagging bad weeks (WMAPE z-score, prior-weeks-only baseline)...')
     all_evals_df = pd.concat(all_evals, ignore_index=True)
     week_flags   = flag_bad_weeks(all_evals_df)
     bad_weeks    = week_flags[week_flags['is_bad_week']]['forecast_week'].tolist()
@@ -107,33 +121,39 @@ def main() -> None:
     ])
     print(f'  {len(bad_weeks)} bad weeks out of {len(backtest_weeks)}')
 
-    print('\nComputing XAI...')
-    # Single model on most recent 3-year window (see module docstring for caveat)
-    # Exclude weeks[-1] (partial week) from training targets too
-    window_start = weeks[-TRAIN_WINDOW - 1]
-    train_df     = load_features_window(conn, window_start, weeks[-2]).dropna(subset=FEATURE_COLS)
-    model        = train_model(train_df)
-    explainer    = make_explainer(model)
+    print('\nComputing XAI (per-retrain-checkpoint model)...')
+    # Use the model that actually produced each week's forecast (same 4-week retrain granularity).
+    # Explainers are cached by cutoff to avoid rebuilding per bad week.
+    explainers_cache: dict[str, object] = {}
 
     for forecast_week in tqdm(bad_weeks, desc='XAI'):
-        week_df = load_features_week(conn, forecast_week)
+        xai_cutoff = week_to_cutoff.get(forecast_week)
+        if xai_cutoff is None or xai_cutoff not in all_models:
+            continue
 
+        xai_model = all_models[xai_cutoff]
+        if xai_cutoff not in explainers_cache:
+            explainers_cache[xai_cutoff] = make_explainer(xai_model)
+        xai_explainer = explainers_cache[xai_cutoff]
+
+        week_df    = load_features_week(conn, forecast_week)
         week_evals = all_evals_df[all_evals_df['forecast_week'] == forecast_week]
         top_items  = week_evals.nlargest(TOP_N_XAI, 'mape')['unique_id'].tolist()
         actual_map = dict(zip(week_evals['unique_id'], week_evals['actual']))
 
-        shap_rows, shap_cache = shap_payloads(explainer, model, week_df, forecast_week, top_items, actual_map)
+        shap_rows, shap_cache = shap_payloads(xai_explainer, xai_model, week_df, forecast_week, top_items, actual_map)
         xai_rows = (
             shap_rows
-            + counterfactual_payloads(model, week_df, forecast_week, top_items, actual_map)
-            + contrastive_payloads(explainer, week_df, forecast_week, top_items, all_evals_df, conn, shap_cache)
+            + counterfactual_payloads(xai_model, week_df, forecast_week, top_items, actual_map)
+            + contrastive_payloads(xai_explainer, week_df, forecast_week, top_items, all_evals_df, conn, shap_cache)
         )
         if xai_rows:
             insert_xai(conn, xai_rows)
 
     conn.close()
     print(f'\nDone -> {DB_PATH}')
-    print('Launch: uv run streamlit run app.py')
+    print('Next: uv run python data_quality.py')
+    print('Then: uv run streamlit run app.py')
 
 
 if __name__ == '__main__':

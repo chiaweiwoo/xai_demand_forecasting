@@ -127,6 +127,14 @@ def load_xai(conn: sqlite3.Connection, week_id: str, item_id: str | None = None)
     return [dict(r) for r in cur.fetchall()]
 
 
+def load_all_shap_payloads(conn: sqlite3.Connection) -> list[dict]:
+    """All SHAP payloads for bad weeks (for recurring-drivers aggregation)."""
+    cur = conn.execute(
+        'SELECT week_id, item_id, payload FROM xai_results WHERE xai_type=?', ('shap',)
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
 def week_summary(conn: sqlite3.Connection) -> pd.DataFrame:
     return pd.read_sql(
         '''SELECT week_id,

@@ -181,7 +181,7 @@ def contrastive_payloads(
         ]
         if same_woy.empty:
             continue  # no same-WOY good week — skip rather than use different seasonality
-        ref_row = same_woy.iloc[-1]
+        ref_row = same_woy.sort_values('forecast_week').iloc[-1]
         item_ref[uid] = (ref_row['forecast_week'], float(ref_row['mape']))
 
     if not item_ref:

@@ -6,12 +6,17 @@ Usage:
 """
 
 import json
+from collections import defaultdict
+
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 
-from xai_forecast.db import get_conn, week_summary, load_evaluations, load_xai
+from xai_forecast.db import (
+    get_conn, week_summary, load_evaluations, load_xai, load_all_shap_payloads,
+)
 
 DB_PATH = 'db/forecasting.db'
 
@@ -38,10 +43,71 @@ def _xai(week_id: str, item_id: str) -> dict[str, dict]:
     return {r['xai_type']: json.loads(r['payload']) for r in rows}
 
 
+def _week_xai(week_id: str) -> list[dict]:
+    """All XAI rows for a bad week (all items, all types)."""
+    with get_conn(DB_PATH) as conn:
+        return load_xai(conn, week_id)
+
+
+@st.cache_data
+def _all_shap_payloads() -> list[dict]:
+    with get_conn(DB_PATH) as conn:
+        return load_all_shap_payloads(conn)
+
+
+def _week_shap_summary(week_id: str) -> pd.DataFrame:
+    """
+    Mean |SHAP| per feature across all SHAP payloads for a bad week.
+    Only features that appeared in the top-5 for at least one SKU are shown.
+    """
+    rows = _week_xai(week_id)
+    feature_scores: dict[str, list[float]] = defaultdict(list)
+    n_skus = 0
+    for r in rows:
+        if r['xai_type'] != 'shap':
+            continue
+        n_skus += 1
+        p = json.loads(r['payload'])
+        for f in p.get('top_features', []):
+            feature_scores[f['feature']].append(abs(f['shap_value']))
+    if not feature_scores:
+        return pd.DataFrame()
+    return pd.DataFrame([
+        {'feature': feat, 'mean_abs_shap': float(np.mean(vals)),
+         'n_skus': len(vals), 'pct_skus': len(vals) / n_skus * 100 if n_skus else 0}
+        for feat, vals in feature_scores.items()
+    ]).sort_values('mean_abs_shap', ascending=False)
+
+
+@st.cache_data
+def _recurring_drivers() -> pd.DataFrame:
+    """
+    Across all bad weeks, how often does each feature appear in the top-5 SHAP drivers?
+    Returns: feature → count (total appearances across all SHAP payloads).
+    """
+    all_rows = _all_shap_payloads()
+    feature_counts: dict[str, int] = defaultdict(int)
+    total_payloads = 0
+    for r in all_rows:
+        p = json.loads(r['payload'])
+        total_payloads += 1
+        for f in p.get('top_features', []):
+            feature_counts[f['feature']] += 1
+    if not feature_counts:
+        return pd.DataFrame()
+    df = pd.DataFrame([
+        {'feature': feat, 'count': cnt,
+         'pct_payloads': cnt / total_payloads * 100 if total_payloads else 0}
+        for feat, cnt in feature_counts.items()
+    ]).sort_values('count', ascending=False)
+    df['total_payloads'] = total_payloads
+    return df
+
+
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 
 st.sidebar.title('XAI Demand Forecasting')
-page = st.sidebar.radio('View', ['Overview', 'Bad Week Drilldown', 'XAI Explorer'])
+page = st.sidebar.radio('View', ['Overview', 'Bad Week Drilldown', 'Recurring Drivers', 'XAI Explorer'])
 
 
 # ── Overview ──────────────────────────────────────────────────────────────────
@@ -117,10 +183,92 @@ elif page == 'Bad Week Drilldown':
         },
     )
 
+    # ── Week-level SHAP driver summary ────────────────────────────────────────
+    st.subheader('What drove the bad week? (aggregated SHAP across top-50 SKUs)')
+    shap_summary = _week_shap_summary(selected)
+    if shap_summary.empty:
+        st.info('No SHAP data for this week. Run backtest to generate XAI.')
+    else:
+        fig_shap = go.Figure(go.Bar(
+            x=shap_summary['mean_abs_shap'],
+            y=shap_summary['feature'],
+            orientation='h',
+            text=shap_summary['pct_skus'].apply(lambda x: f'{x:.0f}% of SKUs'),
+            textposition='outside',
+            marker_color='steelblue',
+        ))
+        fig_shap.update_layout(
+            title='Mean |SHAP| per feature across worst SKUs this week (log-margin space)',
+            xaxis_title='Mean |SHAP|',
+            yaxis=dict(autorange='reversed'),
+            height=max(300, len(shap_summary) * 28),
+            margin=dict(l=160),
+        )
+        st.plotly_chart(fig_shap, use_container_width=True)
+        st.caption(
+            'Only features that appeared in the top-5 for at least one SKU are shown. '
+            '"% of SKUs" = fraction of the top-50 for which this feature was a top driver.'
+        )
+
     st.subheader('MAPE distribution this week')
     fig = px.histogram(week_df, x='h1_mape', nbins=40, title='Item MAPE distribution',
                        color_discrete_sequence=['steelblue'])
     st.plotly_chart(fig, use_container_width=True)
+
+
+# ── Recurring Drivers ─────────────────────────────────────────────────────────
+
+elif page == 'Recurring Drivers':
+    st.title('Recurring Failure Drivers')
+    st.caption(
+        'Across **all** bad weeks, which features most often appear in the top-5 SHAP drivers '
+        'for the worst-performing SKUs? High frequency = systematic model blind spot.'
+    )
+
+    try:
+        drivers = _recurring_drivers()
+    except Exception:
+        st.warning('No data yet. Run: `uv run python backtest.py`')
+        st.stop()
+
+    if drivers.empty:
+        st.info('No SHAP data found. Run backtest.py to generate XAI results.')
+        st.stop()
+
+    total = int(drivers['total_payloads'].iloc[0])
+    st.markdown(f'Based on **{total:,}** SHAP explanations across all bad weeks.')
+
+    fig = go.Figure(go.Bar(
+        x=drivers['count'],
+        y=drivers['feature'],
+        orientation='h',
+        text=drivers['pct_payloads'].apply(lambda x: f'{x:.1f}%'),
+        textposition='outside',
+        marker_color=px.colors.sequential.Blues_r[:len(drivers)],
+    ))
+    fig.update_layout(
+        title='Feature appearance frequency in top-5 SHAP drivers (all bad weeks)',
+        xaxis_title='Count (appearances across all bad-week SHAP payloads)',
+        yaxis=dict(autorange='reversed'),
+        height=max(350, len(drivers) * 28),
+        margin=dict(l=160),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader('Feature frequency table')
+    st.dataframe(
+        drivers[['feature', 'count', 'pct_payloads']].rename(
+            columns={'count': 'Appearances', 'pct_payloads': '% of payloads'}
+        ).reset_index(drop=True),
+        use_container_width=True,
+        column_config={
+            '% of payloads': st.column_config.NumberColumn(format='%.1f%%'),
+        },
+    )
+    st.caption(
+        'A feature appearing in 80% of bad-week payloads is likely a systematic driver. '
+        'Investigate whether it reflects real-world signal or a structural model weakness.'
+    )
 
 
 # ── XAI Explorer ─────────────────────────────────────────────────────────────
@@ -197,7 +345,8 @@ elif page == 'XAI Explorer':
             st.caption(
                 f"Base log-margin: {base_log:.3f} (= log of average prediction). "
                 'SHAP values are additive in log space (Tweedie log-link). '
-                'Red bars push the log-prediction up, blue push it down.'
+                'Red bars push the log-prediction up, blue push it down. '
+                'The "other N features" bar shows the residual so the waterfall reconciles to the prediction.'
             )
 
     # ── Counterfactual ───────────────────────────────────────────────────────
@@ -213,29 +362,55 @@ elif page == 'XAI Explorer':
 
             st.markdown(
                 '**What if we remove each feature?** '
-                'A large negative delta means the feature inflated the prediction '
-                '(possibly explaining why the model over-predicted).'
+                'A large negative delta means the feature inflated the prediction. '
+                'Grayed-out scenarios are features already inactive for this SKU this week — '
+                'zeroing them has no effect by definition.'
             )
-            rows_cf = pd.DataFrame(d['scenarios'])
-            rows_cf.columns = ['Scenario', 'CF prediction', 'Delta', 'Delta %']
 
-            fig = px.bar(
-                rows_cf, x='Scenario', y='Delta',
-                title='Prediction change when feature is zeroed out',
-                color='Delta',
-                color_continuous_scale='RdBu',
-                color_continuous_midpoint=0,
-                text='Delta',
+            scenarios = d['scenarios']
+            rows_cf = []
+            for s in scenarios:
+                active = s.get('was_active', True)
+                rows_cf.append({
+                    'Scenario': s['scenario'],
+                    'Active this week': '✓' if active else '✗ (inactive)',
+                    'CF prediction': s['prediction_cf'],
+                    'Delta': s['delta'],
+                    'Delta %': s['delta_pct'],
+                })
+            rows_df = pd.DataFrame(rows_cf)
+
+            # Only plot active scenarios in the bar chart (inactive delta is trivially ~0)
+            active_rows = rows_df[rows_df['Active this week'] == '✓']
+            if not active_rows.empty:
+                fig = px.bar(
+                    active_rows, x='Scenario', y='Delta',
+                    title='Prediction change when feature is zeroed out (active scenarios only)',
+                    color='Delta',
+                    color_continuous_scale='RdBu',
+                    color_continuous_midpoint=0,
+                    text='Delta',
+                )
+                fig.update_traces(texttemplate='%{text:.1f}', textposition='outside')
+                fig.update_layout(height=340, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info('All features were inactive for this SKU this week.')
+
+            st.dataframe(
+                rows_df,
+                use_container_width=True,
+                column_config={
+                    'Delta': st.column_config.NumberColumn(format='%.2f'),
+                    'Delta %': st.column_config.NumberColumn(format='%.1f%%'),
+                    'CF prediction': st.column_config.NumberColumn(format='%.2f'),
+                },
             )
-            fig.update_traces(texttemplate='%{text:.1f}', textposition='outside')
-            fig.update_layout(height=340, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(rows_cf, use_container_width=True)
 
     # ── Contrastive ──────────────────────────────────────────────────────────
     with tabs[2]:
         if 'contrastive' not in xai:
-            st.info('No contrastive data (no matching good week found).')
+            st.info('No contrastive data (no same-week-of-year good reference found for this SKU).')
         else:
             d = xai['contrastive']
             matched = d.get('seasonality_matched', False)
@@ -248,7 +423,7 @@ elif page == 'XAI Explorer':
             st.caption(
                 'Comparing SHAP values between this bad week and a historical week '
                 'with the same ISO week-of-year where the model performed well. '
-                'Features with large SHAP differences are the structural divergence.'
+                'Features with large SHAP differences are the structural divergence between the two weeks.'
             )
 
             diffs_df = pd.DataFrame(d['top_diffs'])
@@ -265,7 +440,7 @@ elif page == 'XAI Explorer':
             fig.update_layout(
                 barmode='group',
                 title='SHAP values: bad week vs good reference week',
-                yaxis_title='SHAP contribution', height=340,
+                yaxis_title='SHAP contribution (log-margin)', height=340,
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -276,5 +451,7 @@ elif page == 'XAI Explorer':
                     'shap_diff': st.column_config.NumberColumn('SHAP diff', format='%.3f'),
                     'bad_shap': st.column_config.NumberColumn('Bad SHAP', format='%.3f'),
                     'good_shap': st.column_config.NumberColumn('Good SHAP', format='%.3f'),
+                    'bad_value': st.column_config.NumberColumn('Bad value', format='%.2f'),
+                    'good_value': st.column_config.NumberColumn('Good value', format='%.2f'),
                 },
             )
