@@ -135,3 +135,7 @@ def main() -> None:
     conn.close()
     print(f'\nDone -> {DB_PATH}')
     print('Next: uv run python run_xai.py')
+
+
+if __name__ == '__main__':
+    main()
