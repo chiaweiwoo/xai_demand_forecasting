@@ -76,6 +76,8 @@ def shap_payloads(
                 'prediction': round(float(preds[i]), 4),
                 'actual': round(float(actual), 4) if not np.isnan(actual) else None,
                 'error_pct': round(abs(float(preds[i]) - actual) / actual * 100, 2) if actual > 0 else None,
+                'signed_error': round((float(preds[i]) - actual) / actual * 100, 2) if actual > 0 else None,
+                'direction': ('over' if float(preds[i]) > actual else 'under') if actual >= 0 else None,
                 'shap_note': 'values in log-margin space (Tweedie log-link); ranking by |shap| is valid',
                 'other_features_shap': round(other_shap, 4),
                 'top_features': [
@@ -242,8 +244,8 @@ def contrastive_payloads(
                 {
                     'feature': FEATURE_COLS[j],
                     'shap_diff': round(float(sv_bad[j] - sv_ref_item[j]), 4),
-                    'bad_value': round(float(bad_item[FEATURE_COLS].iloc[0, j]), 4),
-                    'good_value': round(float(ref_item[FEATURE_COLS].iloc[0, j]), 4),
+                    'bad_value': round(float(bad_item[FEATURE_COLS].fillna(0).iloc[0, j]), 4),
+                    'good_value': round(float(ref_item[FEATURE_COLS].fillna(0).iloc[0, j]), 4),
                     'bad_shap': round(float(sv_bad[j]), 4),
                     'good_shap': round(float(sv_ref_item[j]), 4),
                 }

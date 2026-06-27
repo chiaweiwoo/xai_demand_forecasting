@@ -14,8 +14,15 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from xai_forecast.db import (
     get_conn, week_summary, load_evaluations, load_xai, load_all_shap_payloads,
+    load_narrative,
 )
 
 DB_PATH = 'db/forecasting.db'
@@ -104,6 +111,44 @@ def _recurring_drivers() -> pd.DataFrame:
     return df
 
 
+def _week_narrative(week_id: str) -> dict | None:
+    try:
+        with get_conn(DB_PATH) as conn:
+            return load_narrative(conn, 'week', week_id)
+    except Exception:
+        return None
+
+
+def _item_narrative(week_id: str, item_id: str) -> dict | None:
+    try:
+        with get_conn(DB_PATH) as conn:
+            return load_narrative(conn, 'item', f'{week_id}::{item_id}')
+    except Exception:
+        return None
+
+
+@st.cache_data
+def _executive_narrative() -> dict | None:
+    try:
+        with get_conn(DB_PATH) as conn:
+            return load_narrative(conn, 'executive', 'overall')
+    except Exception:
+        return None
+
+
+def _render_narrative(narr: dict) -> None:
+    """Render a narrative dict as a styled info box."""
+    conf = narr.get('confidence', '')
+    badge = {'high': '🟢 High', 'medium': '🟡 Medium', 'low': '🔴 Low'}.get(conf, conf)
+    grounding_note = ' *(grounding check flagged — verify manually)*' if narr.get('grounding_warning') else ''
+    st.info(
+        f"**{narr.get('headline', '')}**\n\n"
+        f"{narr.get('body', '')}\n\n"
+        f"*Primary driver: `{narr.get('primary_driver', '?')}` · "
+        f"Confidence: {badge}{grounding_note}*"
+    )
+
+
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 
 st.sidebar.title('XAI Demand Forecasting')
@@ -166,6 +211,10 @@ elif page == 'Bad Week Drilldown':
 
     selected = st.selectbox('Select a bad week', bad_weeks)
     week_df = evals[evals['week_id'] == selected].sort_values('h1_mape', ascending=False)
+
+    narr = _week_narrative(selected)
+    if narr:
+        _render_narrative(narr)
 
     c1, c2, c3 = st.columns(3)
     c1.metric('Items tracked', len(week_df))
@@ -235,6 +284,10 @@ elif page == 'Recurring Drivers':
         st.info('No SHAP data found. Run backtest.py to generate XAI results.')
         st.stop()
 
+    exec_narr = _executive_narrative()
+    if exec_narr:
+        _render_narrative(exec_narr)
+
     total = int(drivers['total_payloads'].iloc[0])
     st.markdown(f'Based on **{total:,}** SHAP explanations across all bad weeks.')
 
@@ -297,6 +350,10 @@ elif page == 'XAI Explorer':
     if not xai:
         st.info('No XAI data for this item. Only the top 50 worst items per bad week are explained.')
         st.stop()
+
+    item_narr = _item_narrative(selected_week, selected_item)
+    if item_narr:
+        _render_narrative(item_narr)
 
     tabs = st.tabs(['SHAP', 'Counterfactual', 'Contrastive'])
 

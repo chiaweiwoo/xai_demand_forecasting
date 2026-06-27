@@ -17,7 +17,7 @@ uv run python smoke_test.py      # sanity check before full run (staleness, cont
 uv run python backtest.py        # full backtest (~120 weeks, ~30 retrains)
 uv run python data_quality.py    # post-backtest integrity checks (run before opening dashboard)
 uv run streamlit run app.py      # dashboard at localhost:8501
-uv run pytest                    # 53 tests covering features, evaluation, XAI contracts, DB, end-to-end
+uv run pytest                    # 73 tests covering features, evaluation, XAI contracts, DB, end-to-end, narratives
 ```
 
 **Critical invariant: rebuild the feature store whenever `features.py` changes.**
@@ -31,18 +31,24 @@ build_features.py  One-time: compute_features() on all 847k rows → features ta
 backtest.py        Sliding-window train/forecast/evaluate/xai → output tables
                    Keeps all retrain checkpoints in memory; XAI uses the exact model
                    that produced each week's forecast (per-checkpoint, not one final model).
-smoke_test.py      Sanity check: feature staleness, parallel forecast, contrastive, SHAP additivity
+smoke_test.py      Sanity check: feature staleness, parallel forecast, contrastive, SHAP additivity,
+                   + narrative API probe (one live DeepSeek call — fails loudly if config is wrong)
 data_quality.py    Post-backtest: referential integrity, h1>=0, pre-launch price leakage, etc.
 app.py             Streamlit dashboard (4 pages — see Dashboard section)
 
 xai_forecast/
   features.py      FEATURE_COLS, compute_features(raw_df) — single source of truth for all features
   db.py            SQLite helpers: get_conn (auto-applies schema), load_features_window,
-                   load_features_week, insert_*, week_summary, load_all_shap_payloads
+                   load_features_week, insert_*, week_summary, load_all_shap_payloads,
+                   insert_narrative, load_narrative, load_narratives_by_scope
   train.py         train_model(df) → LGBMRegressor (Tweedie objective)
   forecast.py      make_forecasts(model, week_df, week) → [unique_id, h1]
   evaluate.py      evaluate_h1, flag_bad_weeks (rolling WMAPE z-score, prior-weeks-only baseline)
   xai.py           shap_payloads → (rows, shap_cache), counterfactual_payloads, contrastive_payloads
+                   Payloads include signed_error + direction (over/under) for narrative layer.
+  narrate.py       LLM narrative layer (DeepSeek V4 Flash). Build dossiers (pure) → generate narratives.
+                   Graceful no-key fallback — returns None if DEEPSEEK_API_KEY is unset.
+                   WEEK_NARRATIVE_PROMPT, ITEM_NARRATIVE_PROMPT, EXECUTIVE_NARRATIVE_PROMPT constants.
 
 tests/
   conftest.py           Shared fixtures: raw_df, trained_model_and_explainer, db_conn
@@ -52,11 +58,13 @@ tests/
   test_db.py            Group D: INSERT OR REPLACE, read-back, clean-slate DELETE, features shape
   test_contrastive.py   Contrastive: WOY selection, skip-when-no-match, shap_diff math, cache equality
   test_correctness.py   Regression: baseline excludes current week, NaN forecast, wiring, end-to-end
+  test_narrate.py       Narrate: dossier builders (pure), grounding check, no-key fallback, mock LLM
 
 migrations/
   001_raw_tables.sql     weekly_sales, calendar, prices, item_meta (+ indexes)
   002_output_tables.sql  forecasts, evaluations, xai_results (+ indexes)
   003_features_table.sql features (+ index on week)
+  004_narratives.sql     narratives (scope, key, payload, model, created_at) — PRIMARY KEY (scope, key)
 
 data/   M5 raw files (gitignored — downloaded by ingest.py)
 db/     SQLite databases (gitignored): forecasting.db (production), smoke.db (throwaway)
@@ -76,6 +84,7 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 | `forecasts` | backtest.py | h=1 predictions per SKU per forecast week |
 | `evaluations` | backtest.py | MAPE, MAE, WMAPE z-score, bad-week flag per SKU per week |
 | `xai_results` | backtest.py | JSON payloads: shap / counterfactual / contrastive |
+| `narratives` | backtest.py | LLM-generated narratives (scope: week/item/executive), keyed by (scope, key) |
 
 ## Key design decisions
 
@@ -110,7 +119,7 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 
 **Week key convention:** All output tables (forecasts, evaluations, xai_results) are keyed on `forecast_week` — the week the error was observed. Not the training cutoff. This is the natural "week X" a leader would point at.
 
-**Idempotency:** `backtest.py` deletes all rows from forecasts/evaluations/xai_results at the start of each run. Re-running always produces a clean result with no orphan rows.
+**Idempotency:** `backtest.py` deletes all rows from forecasts/evaluations/xai_results/narratives at the start of each run. Re-running always produces a clean result with no orphan rows.
 
 **Smoke test isolation:** `smoke_test.py` reads from `db/forecasting.db` (source DB, never written to) and writes all output to `db/smoke.db` (throwaway). Running the smoke test never contaminates dashboard data.
 
@@ -123,6 +132,17 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 
 **shap_payloads API:** Returns `(list[dict], dict[str, np.ndarray])` — the DB rows and a `shap_cache` mapping uid → raw SHAP array. Pass `shap_cache` to `contrastive_payloads` as `bad_shap_cache` to avoid recomputing bad-item SHAP. Both `backtest.py` and `smoke_test.py` do this.
 
+**SHAP payload extras:** Each SHAP row now includes `signed_error` (signed % error, positive = over-forecast) and `direction` ("over"/"under") so the LLM narrative layer can reference error direction without computing it.
+
+**LLM narrative layer (`xai_forecast/narrate.py`):**
+- `DeepSeekNarrator` wraps DeepSeek V4 Flash (`deepseek-v4-flash`) via the OpenAI SDK (base_url = `https://api.deepseek.com`). Key via `DEEPSEEK_API_KEY` env var. Set in `.env` (copy from `.env.example`).
+- Three prompt constants: `WEEK_NARRATIVE_PROMPT`, `ITEM_NARRATIVE_PROMPT`, `EXECUTIVE_NARRATIVE_PROMPT`. These are `*_PROMPT` constants — run `/prompt-audit` before editing them.
+- Three dossier builders (pure functions, no network): `build_week_dossier`, `build_item_dossier`, `build_executive_dossier`.
+- Post-generation grounding check: verifies `primary_driver` is in the evidence feature list. Sets `confidence=low` + `grounding_warning=True` if it fails.
+- Narratives are generated during `backtest.py` (after XAI phase) and cached in the `narratives` table.
+- If `DEEPSEEK_API_KEY` is not set, narratives are skipped silently. Dashboard falls back to charts only.
+- Smoke test includes one live API probe (real call, fails loudly on bad config).
+
 **Pre-launch SKUs:** A SKU in its pre-launch weeks has all-NaN lag features. `make_forecasts` imputes these to 0 (via `.fillna(0)` before `model.predict`). If such a SKU has `y > 0` in that week, it is evaluated against a garbage forecast. `backtest.py` counts and logs these rows. `data_quality.py` checks for pre-launch price leakage (sell_price non-null with lag_1 null — would indicate the bfill bug returning).
 
 ## Dashboard pages
@@ -130,9 +150,9 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 | Page | What it shows |
 |---|---|
 | Overview | Weekly MAPE time series with bad-week markers |
-| Bad Week Drilldown | Worst items, MAPE distribution, **week-level SHAP aggregation** (mean \|SHAP\| across top-50 SKUs) |
-| Recurring Drivers | Feature appearance frequency across all bad weeks (systematic failure pattern detection) |
-| XAI Explorer | Per-item SHAP waterfall, counterfactual (inactive scenarios grayed), contrastive |
+| Bad Week Drilldown | LLM week narrative (headline card) + worst items + MAPE distribution + week-level SHAP aggregation |
+| Recurring Drivers | LLM executive synthesis + feature appearance frequency across all bad weeks |
+| XAI Explorer | LLM item narrative + per-item SHAP waterfall, counterfactual (inactive grayed), contrastive |
 
 ## Stack
 
@@ -140,3 +160,4 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 - LightGBM + SHAP
 - SQLite (stdlib) — WAL mode enabled
 - Streamlit + Plotly
+- DeepSeek V4 Flash via `openai` SDK (narrative layer, optional)

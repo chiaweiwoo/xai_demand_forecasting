@@ -12,7 +12,7 @@ Runs a full sliding-window backtest over 5 years of Walmart CA_1 store sales (~3
 
 XAI explanations come from the actual retrain checkpoint that produced each week's forecast — not a single final model — so the explanations are faithful to what the model knew at the time.
 
-Results are stored in SQLite and explored through a four-page Streamlit dashboard.
+Results are stored in SQLite and explored through a four-page Streamlit dashboard. Each bad week gets an LLM-generated plain-English narrative (DeepSeek V4 Flash) explaining the failure in business terms — no jargon, grounded only in the XAI evidence.
 
 ## Setup
 
@@ -20,16 +20,20 @@ Results are stored in SQLite and explored through a four-page Streamlit dashboar
 # Install dependencies
 uv sync
 
+# (Optional) Configure LLM narrative layer
+cp .env.example .env
+# Edit .env and set DEEPSEEK_API_KEY — narratives are skipped if key is absent
+
 # Download M5 data and ingest into SQLite (run once)
 uv run python ingest.py
 
 # Precompute feature store (run once; re-run whenever features.py changes)
 uv run python build_features.py
 
-# Sanity check before full run
+# Sanity check before full run (includes live API probe if DEEPSEEK_API_KEY is set)
 uv run python smoke_test.py
 
-# Full backtest (~120 weeks, ~30 retrains)
+# Full backtest (~120 weeks, ~30 retrains) + narrative generation
 uv run python backtest.py
 
 # Post-backtest data quality checks
@@ -64,14 +68,14 @@ app.py             Streamlit dashboard (4 pages)
 | Page | Purpose |
 |---|---|
 | Overview | Weekly MAPE time series with bad-week markers |
-| Bad Week Drilldown | Worst items table + week-level SHAP aggregation (what drove the whole week) |
-| Recurring Drivers | Feature frequency across all bad weeks — systematic failure pattern detection |
-| XAI Explorer | Per-item deep-dive: SHAP waterfall, counterfactual, contrastive |
+| Bad Week Drilldown | LLM narrative card + worst items table + week-level SHAP aggregation |
+| Recurring Drivers | LLM executive synthesis + feature frequency across all bad weeks |
+| XAI Explorer | LLM item narrative + SHAP waterfall, counterfactual, contrastive |
 
 ## Testing
 
 ```bash
-uv run pytest          # 53 tests, ~3s
+uv run pytest          # 73 tests, ~4s
 ```
 
 Test groups:
@@ -81,6 +85,7 @@ Test groups:
 - **D (DB):** INSERT OR REPLACE idempotency, read-back, clean-slate DELETE
 - **Contrastive:** same-WOY selection, skip-when-no-match, shap_diff math, cache equality
 - **Correctness regression:** baseline shift(1) property, NaN forecast handling, end-to-end mini-backtest
+- **Narrate:** dossier builders (pure), grounding check, no-key fallback, mocked LLM schema + round-trip
 
 ## Stack
 
@@ -88,6 +93,7 @@ Test groups:
 - LightGBM + SHAP
 - SQLite (WAL mode)
 - Streamlit + Plotly
+- DeepSeek V4 Flash via `openai` SDK (narrative layer, optional — set `DEEPSEEK_API_KEY`)
 
 ## Data
 

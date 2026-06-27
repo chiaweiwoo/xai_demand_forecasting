@@ -11,6 +11,8 @@ dependencies = [
     "datasetsforecast>=0.0.8",
     "plotly>=5.18",
     "tqdm>=4.65",
+    "openai>=1.30",
+    "python-dotenv>=1.0",
 ]
 
 [build-system]

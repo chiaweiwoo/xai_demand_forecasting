@@ -1,5 +1,8 @@
+import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
+
 import pandas as pd
 
 DB_PATH = Path('db/forecasting.db')
@@ -133,6 +136,29 @@ def load_all_shap_payloads(conn: sqlite3.Connection) -> list[dict]:
         'SELECT week_id, item_id, payload FROM xai_results WHERE xai_type=?', ('shap',)
     )
     return [dict(r) for r in cur.fetchall()]
+
+
+# ── Narrative reads/writes ────────────────────────────────────────────────────
+
+def insert_narrative(conn: sqlite3.Connection, scope: str, key: str,
+                     payload: dict, model: str) -> None:
+    conn.execute(
+        'INSERT OR REPLACE INTO narratives (scope, key, payload, model, created_at) VALUES (?, ?, ?, ?, ?)',
+        (scope, key, json.dumps(payload), model, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+
+
+def load_narrative(conn: sqlite3.Connection, scope: str, key: str) -> dict | None:
+    cur = conn.execute('SELECT payload FROM narratives WHERE scope=? AND key=?', (scope, key))
+    row = cur.fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def load_narratives_by_scope(conn: sqlite3.Connection, scope: str) -> dict[str, dict]:
+    """Returns {key: payload_dict} for all narratives with the given scope."""
+    cur = conn.execute('SELECT key, payload FROM narratives WHERE scope=?', (scope,))
+    return {row[0]: json.loads(row[1]) for row in cur.fetchall()}
 
 
 def week_summary(conn: sqlite3.Connection) -> pd.DataFrame:
