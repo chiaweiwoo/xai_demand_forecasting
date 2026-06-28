@@ -10,7 +10,7 @@ Outputs:
 
 Next steps:
   uv run python run_xai.py           # SHAP / counterfactual / contrastive
-  uv run python generate_narratives.py  # LLM narratives
+  uv run python generate_insights.py    # evidence-first insights
   uv run python data_quality.py
   uv run streamlit run app.py
 """
@@ -65,7 +65,7 @@ def main() -> None:
     print(f'Backtest: {len(backtest_weeks)} weeks | ~{len(backtest_weeks) // RETRAIN_FREQ} retrains\n')
 
     # Clean slate for forecast/evaluation tables only.
-    # xai_results and narratives are managed by run_xai.py / generate_narratives.py.
+    # xai_results and insights are managed by run_xai.py / generate_insights.py.
     conn.executescript('DELETE FROM forecasts; DELETE FROM evaluations;')
     conn.commit()
 

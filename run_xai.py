@@ -9,7 +9,7 @@ Writes to:  db/forecasting.db (xai_results)
 Run backtest.py first to produce the checkpoint models and week_to_cutoff.json.
 Safe to re-run — clears xai_results at start.
 
-Next: uv run python generate_narratives.py
+Next: uv run python generate_insights.py
 """
 
 import json
@@ -65,7 +65,7 @@ def main() -> None:
     bad_weeks = sorted(bad_weeks)
     print(f'\n{len(bad_weeks)} bad weeks to process')
 
-    # Clean slate for XAI results (narratives managed separately by generate_narratives.py)
+    # Clean slate for XAI results (insights managed separately by generate_insights.py)
     conn.execute('DELETE FROM xai_results')
     conn.commit()
 
@@ -103,7 +103,7 @@ def main() -> None:
 
     conn.close()
     print(f'\nDone -> {DB_PATH}')
-    print('Next: uv run python generate_narratives.py')
+    print('Next: uv run python generate_insights.py')
 
 
 if __name__ == '__main__':

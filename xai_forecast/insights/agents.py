@@ -212,8 +212,14 @@ def run_critic(
     finding: CandidateFinding,
     hypothesis: Hypothesis,
     enriched_evidence: dict[str, Any],
+    grounding_advisory: dict[str, Any] | None = None,
 ) -> Critique:
-    """Pro: reject overclaim, enforce correlation-only for external signals."""
+    """Pro: reject overclaim, enforce correlation-only for external signals.
+
+    grounding_advisory is optional context from the deterministic grounding check.
+    When present (grounding_ok=False), it flags refs Flash cited that don't map
+    to any evidence key — the critic uses this as one signal among many.
+    """
     payload = {
         'finding_type': finding.finding_type,
         'finding_summary': finding.summary,
@@ -225,7 +231,11 @@ def run_critic(
             'confidence':    hypothesis.confidence,
         },
     }
-    log.debug('CRITIC input: headline=%r confidence=%s', hypothesis.headline, hypothesis.confidence)
+    if grounding_advisory is not None:
+        payload['grounding_advisory'] = grounding_advisory
+    log.debug('CRITIC input: headline=%r confidence=%s grounding_ok=%s',
+              hypothesis.headline, hypothesis.confidence,
+              grounding_advisory.get('grounding_ok') if grounding_advisory else 'n/a')
     result = client.call_pro(CRITIC_PROMPT, payload)
     log.debug('CRITIC raw response: %s', result)
     critique = Critique(

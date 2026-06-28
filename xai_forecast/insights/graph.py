@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from operator import add
 from typing import Annotated, Any, TypedDict
@@ -92,16 +93,37 @@ def _enrich_evidence(
     return enriched
 
 
-def _flatten_keys(d: dict, prefix: str = '') -> list[str]:
-    """Return all dot-path keys in a nested dict, e.g. 'forecast_accuracy.n_bad_weeks'."""
-    keys = []
+def _normalize_ref(ref: str) -> str:
+    """Normalize a Flash evidence_ref: convert [N] bracket notation to .N dot notation."""
+    return re.sub(r'\[(\d+)\]', r'.\1', ref)
+
+
+def _build_evidence_key_set(d: dict, prefix: str = '') -> set[str]:
+    """Build every matchable key from a nested evidence dict.
+
+    Includes full dot-paths AND bare leaf names so Flash's evidence_refs
+    can match regardless of nesting depth or index notation.
+
+    Examples:
+      enriched key 'model_metadata.global_feature_importance'
+        → matched by bare ref 'global_feature_importance'
+      enriched key 'notable_weeks.0.gas_price'
+        → matched by bare ref 'gas_price'
+      enriched key 'scenario_impacts.0.scenario'
+        → matched by normalized ref 'scenario_impacts.0.scenario'
+          (Flash writes 'scenario_impacts[0].scenario' → _normalize_ref converts it)
+    """
+    keys: set[str] = set()
     for k, v in d.items():
         full = f'{prefix}.{k}' if prefix else k
-        keys.append(full)
+        keys.add(full)
+        keys.add(k)  # bare leaf always matchable
         if isinstance(v, dict):
-            keys.extend(_flatten_keys(v, full))
-        elif isinstance(v, list) and v and isinstance(v[0], dict):
-            keys.extend(_flatten_keys(v[0], f'{full}.0'))
+            keys |= _build_evidence_key_set(v, full)
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    keys |= _build_evidence_key_set(item, full)
     return keys
 
 
@@ -137,7 +159,7 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
         ]
 
     def review_finding(state: dict) -> dict:
-        """Per-finding node: plan → enrich → hypothesis → grounding check → critic → LedgerRow."""
+        """Per-finding node: plan → enrich → hypothesis → grounding advisory → critic → LedgerRow."""
         finding: CandidateFinding = state['finding']
         ft = finding.finding_type
 
@@ -154,34 +176,29 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
         log.info('[%s] hypothesis: headline=%r confidence=%s', ft, hypothesis.headline, hypothesis.confidence)
         log.debug('[%s] hypothesis evidence_refs: %s', ft, hypothesis.evidence_refs)
 
-        # Deterministic grounding check: verify evidence_refs point to real evidence keys.
+        # Grounding check — advisory only.  Result is forwarded to the critic
+        # as extra context; it does NOT gate or mutate hypothesis confidence.
+        # Pro critic is the single quality gate and makes the final call.
+        grounding_advisory: dict | None = None
         if hypothesis.evidence_refs:
-            evidence_keys = set(_flatten_keys(enriched))
-            missing = [r for r in hypothesis.evidence_refs if r not in evidence_keys]
+            evidence_keys = _build_evidence_key_set(enriched)
+            missing = [
+                ref for ref in hypothesis.evidence_refs
+                if _normalize_ref(ref) not in evidence_keys and ref not in evidence_keys
+            ]
             if missing:
-                log.warning('[%s] GROUNDING FAIL — refs not in evidence: %s', ft, missing)
-                hypothesis.confidence = 'low'
+                log.warning('[%s] GROUNDING ADVISORY — unmatched refs (forwarding to critic): %s', ft, missing)
+                grounding_advisory = {'grounding_ok': False, 'missing_refs': missing}
             else:
                 log.debug('[%s] grounding OK — all %d refs found', ft, len(hypothesis.evidence_refs))
+                grounding_advisory = {'grounding_ok': True, 'missing_refs': []}
 
-        # Skip Pro critic for low-confidence hypotheses.
-        if hypothesis.confidence == 'low':
-            log.info('[%s] skipping critic (confidence=low → needs_review)', ft)
-            from xai_forecast.insights.schemas import Critique
-            critique = Critique(
-                finding_id=finding.finding_id,
-                status='needs_review',
-                confidence='low',
-                notes='Skipped Pro critic: hypothesis confidence was low (thin evidence or grounding failure).',
-                overclaim=False,
-                causal_external=False,
-            )
-        else:
-            log.info('[%s] running critic (Pro)...', ft)
-            critique = run_critic(client, finding, hypothesis, enriched)
-            log.info('[%s] critic: status=%s confidence=%s overclaim=%s causal_external=%s',
-                     ft, critique.status, critique.confidence, critique.overclaim, critique.causal_external)
-            log.debug('[%s] critic notes: %s', ft, critique.notes)
+        # Always run Pro critic — it is the single quality gate.
+        log.info('[%s] running critic (Pro)...', ft)
+        critique = run_critic(client, finding, hypothesis, enriched, grounding_advisory=grounding_advisory)
+        log.info('[%s] critic: status=%s confidence=%s overclaim=%s causal_external=%s',
+                 ft, critique.status, critique.confidence, critique.overclaim, critique.causal_external)
+        log.debug('[%s] critic notes: %s', ft, critique.notes)
 
         log.info('[%s] RESULT: status=%s confidence=%s', ft, critique.status, critique.confidence)
 
