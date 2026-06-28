@@ -4,13 +4,17 @@ LangGraph orchestrator for the insights pipeline.
 Graph shape:
   detect_candidates → fan-out per finding (hypothesis → critic) → fan-in → synthesize
 
+Async execution: nodes are async def; graph is invoked via ainvoke so LangGraph
+runs the fan-out review_finding nodes concurrently (asyncio tasks, not threads).
+The two synthesis passes (business + technical) also run concurrently via asyncio.gather.
+
 conn and client are captured in node-function closures — they never enter the
-LangGraph state dict, which keeps the state serialisation-safe and avoids
-KeyError when LangGraph passes only the node-output delta to edge routers.
+LangGraph state dict, which keeps state serialisation-safe.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -23,7 +27,13 @@ log = logging.getLogger(__name__)
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from .agents import run_planner, run_hypothesis, run_critic, run_synthesis
+from .agents import (
+    run_planner_async,
+    run_hypothesis_async,
+    run_critic_async,
+    run_business_synthesis,
+    run_technical_synthesis,
+)
 from .detectors import run_all_detectors
 from .llm_client import DeepSeekClient
 from .schemas import CandidateFinding, LedgerRow
@@ -103,15 +113,6 @@ def _build_evidence_key_set(d: dict, prefix: str = '') -> set[str]:
 
     Includes full dot-paths AND bare leaf names so Flash's evidence_refs
     can match regardless of nesting depth or index notation.
-
-    Examples:
-      enriched key 'model_metadata.global_feature_importance'
-        → matched by bare ref 'global_feature_importance'
-      enriched key 'notable_weeks.0.gas_price'
-        → matched by bare ref 'gas_price'
-      enriched key 'scenario_impacts.0.scenario'
-        → matched by normalized ref 'scenario_impacts.0.scenario'
-          (Flash writes 'scenario_impacts[0].scenario' → _normalize_ref converts it)
     """
     keys: set[str] = set()
     for k, v in d.items():
@@ -152,33 +153,32 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
         if not candidates:
             log.info('No candidates — jumping to synthesize')
             return 'synthesize'
-        log.info('Routing %d findings for review', len(candidates))
-        return [
-            Send('review_finding', {'finding': c})
-            for c in candidates
-        ]
+        log.info('Routing %d findings for concurrent async review', len(candidates))
+        return [Send('review_finding', {'finding': c}) for c in candidates]
 
-    def review_finding(state: dict) -> dict:
-        """Per-finding node: plan → enrich → hypothesis → grounding advisory → critic → LedgerRow."""
+    async def review_finding(state: dict) -> dict:
+        """Per-finding async node: plan → enrich → hypothesis → grounding advisory → critic.
+
+        All LLM calls use the async client methods so LangGraph can run
+        multiple findings concurrently when invoked via ainvoke.
+        _enrich_evidence is sync (SQLite reads) but is fast relative to LLM calls.
+        """
         finding: CandidateFinding = state['finding']
         ft = finding.finding_type
 
-        log.info('[%s] planning evidence gathering (Flash)...', ft)
-        tools_to_run = run_planner(client, finding)
+        log.info('[%s] planning evidence gathering (Flash async)...', ft)
+        tools_to_run = await run_planner_async(client, finding)
         log.info('[%s] planner chose: %s', ft, tools_to_run)
 
         log.info('[%s] enriching evidence with %d tools...', ft, len(tools_to_run))
         enriched = _enrich_evidence(conn, finding, tools_to_run)
         log.debug('[%s] enriched evidence keys: %s', ft, list(enriched.keys()))
 
-        log.info('[%s] running hypothesis (Flash)...', ft)
-        hypothesis = run_hypothesis(client, finding, enriched)
+        log.info('[%s] running hypothesis (Flash async)...', ft)
+        hypothesis = await run_hypothesis_async(client, finding, enriched)
         log.info('[%s] hypothesis: headline=%r confidence=%s', ft, hypothesis.headline, hypothesis.confidence)
-        log.debug('[%s] hypothesis evidence_refs: %s', ft, hypothesis.evidence_refs)
 
-        # Grounding check — advisory only.  Result is forwarded to the critic
-        # as extra context; it does NOT gate or mutate hypothesis confidence.
-        # Pro critic is the single quality gate and makes the final call.
+        # Grounding check — advisory only. Result forwarded to critic, not a gate.
         grounding_advisory: dict | None = None
         if hypothesis.evidence_refs:
             evidence_keys = _build_evidence_key_set(enriched)
@@ -194,12 +194,10 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
                 grounding_advisory = {'grounding_ok': True, 'missing_refs': []}
 
         # Always run Pro critic — it is the single quality gate.
-        log.info('[%s] running critic (Pro)...', ft)
-        critique = run_critic(client, finding, hypothesis, enriched, grounding_advisory=grounding_advisory)
-        log.info('[%s] critic: status=%s confidence=%s overclaim=%s causal_external=%s',
-                 ft, critique.status, critique.confidence, critique.overclaim, critique.causal_external)
-        log.debug('[%s] critic notes: %s', ft, critique.notes)
-
+        log.info('[%s] running critic (Pro async)...', ft)
+        critique = await run_critic_async(
+            client, finding, hypothesis, enriched, grounding_advisory=grounding_advisory,
+        )
         log.info('[%s] RESULT: status=%s confidence=%s', ft, critique.status, critique.confidence)
 
         row = LedgerRow(
@@ -217,8 +215,8 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
         )
         return {'ledger_rows': [row]}
 
-    def synthesize(state: dict) -> dict:
-        """Fan-in: combine accepted findings into the two-perspective summary."""
+    async def synthesize(state: dict) -> dict:
+        """Fan-in: run business + technical synthesis concurrently, combine into summary dict."""
         rows = state.get('ledger_rows', [])
 
         accepted = [
@@ -233,32 +231,51 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
             if r.status == 'accepted'
         ]
 
-        log.info('Synthesis: %d accepted / %d total (Flash)...', len(accepted), len(rows))
+        log.info('Synthesis: %d accepted / %d total — running business + technical passes concurrently...',
+                 len(accepted), len(rows))
 
         if not accepted:
             log.warning('No accepted findings — returning inconclusive summary')
-            summary = {
-                'data_scientist': {
-                    'headline': 'Insufficient evidence for confident findings',
-                    'summary':  'All candidate findings were rejected or flagged for review.',
-                    'top_issues': [],
-                    'recommended_actions': ['Collect more backtest weeks before re-running insights'],
+            biz = {
+                'headline': 'Analysis inconclusive — more data needed',
+                'progress': {
+                    'health_verdict': 'Insufficient evidence to assess model health.',
+                    'what_we_diagnosed': 'The automated review could not confirm specific failure patterns.',
+                    'confidence': 'low',
                 },
-                'business_leader': {
-                    'headline': 'Analysis inconclusive — more data needed',
-                    'summary':  'The automated review could not confirm specific failure patterns.',
-                    'risk_direction': 'mixed',
-                    'limitations': ['Insufficient data for confident conclusions'],
-                    'improvement_plan': 'Extend the backtest period and re-run the insights analysis.',
+                'plan': {
+                    'phases': [{
+                        'name': 'Immediate',
+                        'action': 'Extend the backtest period and re-run the insights analysis.',
+                        'risk_if_skipped': 'No basis for procurement or operational decisions.',
+                    }],
+                    'expected_impact': 'More data will enable a meaningful diagnosis.',
                 },
+                'limitations': ['Insufficient backtest weeks for confident conclusions'],
+                'risk_direction': 'mixed',
+                'overall_confidence': 'low',
+            }
+            tech = {
+                'headline': 'No confirmed patterns to guide improvements',
+                'summary': 'All candidate findings were rejected or flagged for review. Re-run with more backtest weeks.',
+                'levers': [],
                 'overall_confidence': 'low',
             }
         else:
-            summary = run_synthesis(client, accepted)
-            log.info('Synthesis complete: overall_confidence=%s', summary.get('overall_confidence'))
-            log.debug('DS headline: %s', summary.get('data_scientist', {}).get('headline'))
-            log.debug('Biz headline: %s', summary.get('business_leader', {}).get('headline'))
+            # Both synthesis passes run concurrently — each is one Flash call.
+            biz, tech = await asyncio.gather(
+                run_business_synthesis(client, accepted),
+                run_technical_synthesis(client, accepted),
+            )
+            log.info('Business synthesis: overall_confidence=%s', biz.get('overall_confidence'))
+            log.info('Technical synthesis: overall_confidence=%s levers=%d',
+                     tech.get('overall_confidence'), len(tech.get('levers', [])))
 
+        summary = {
+            'business_leader':    biz,
+            'data_scientist':     tech,
+            'overall_confidence': biz.get('overall_confidence', 'medium'),
+        }
         return {'summary': summary}
 
     builder = StateGraph(_State)
@@ -274,17 +291,17 @@ def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
     return builder.compile(name='xai-insights-graph')
 
 
-def run_insights_graph(
+async def run_insights_graph(
     conn: sqlite3.Connection,
     client: DeepSeekClient,
 ) -> tuple[list[LedgerRow], dict[str, Any]]:
     """
-    Entry point. Returns (ledger_rows, summary_dict).
+    Async entry point. Returns (ledger_rows, summary_dict).
     ledger_rows includes all findings (accepted + rejected + needs_review).
-    summary_dict is the two-perspective synthesis.
+    summary_dict has business_leader and data_scientist keys.
     """
     graph = _build_graph(conn, client)
-    result = graph.invoke(
+    result = await graph.ainvoke(
         {
             'candidates':  [],
             'ledger_rows': [],

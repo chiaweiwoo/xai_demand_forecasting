@@ -9,9 +9,13 @@ Requires DEEPSEEK_API_KEY in .env. Fails loudly if key is absent.
 Run run_xai.py first to populate xai_results.
 Safe to re-run — clears insight tables at start and regenerates all.
 
+Async: finding review nodes run concurrently (one asyncio task per finding).
+       Business + technical synthesis run concurrently via asyncio.gather.
+
 Next: uv run python data_quality.py
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -36,13 +40,11 @@ def _setup_logging() -> logging.Logger:
     root.setLevel(logging.DEBUG)
     root.handlers.clear()
 
-    # Console — INFO only (same as the current print output)
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(logging.Formatter(fmt, datefmt))
     root.addHandler(ch)
 
-    # File — DEBUG (full agent trace)
     fh = logging.FileHandler(log_path, mode='w', encoding='utf-8')
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(fmt, datefmt))
@@ -62,7 +64,7 @@ from xai_forecast.insights.graph import run_insights_graph
 DB_PATH = 'db/forecasting.db'
 
 
-def main() -> None:
+async def main() -> None:
     logger.info('Loading DB: %s', DB_PATH)
     conn = get_conn(DB_PATH)
 
@@ -87,8 +89,8 @@ def main() -> None:
     conn.commit()
     logger.info('Cleared insight tables.')
 
-    logger.info('Running insights graph...')
-    ledger_rows, summary = run_insights_graph(conn, client)
+    logger.info('Running insights graph (async — findings reviewed concurrently)...')
+    ledger_rows, summary = await run_insights_graph(conn, client)
 
     from datetime import datetime, UTC
     for row in ledger_rows:
@@ -105,14 +107,14 @@ def main() -> None:
         logger.debug('Persisted finding: %s | status=%s confidence=%s',
                      row.finding_id, row.status, row.confidence)
 
-    ds  = summary.get('data_scientist', {})
-    biz = summary.get('business_leader', {})
-    # overall_confidence is a top-level synthesis key — fold it into both perspective
-    # dicts so it survives persistence (insert_insight_summary stores only these two).
+    biz  = summary.get('business_leader', {})
+    tech = summary.get('data_scientist', {})
+    # overall_confidence is a top-level synthesis key — fold it into both dicts
+    # so it survives persistence (insert_insight_summary stores only these two).
     overall_conf = summary.get('overall_confidence', 'medium')
-    ds.setdefault('overall_confidence', overall_conf)
     biz.setdefault('overall_confidence', overall_conf)
-    insert_insight_summary(conn, ds, biz, client.flash_model, client.pro_model)
+    tech.setdefault('overall_confidence', overall_conf)
+    insert_insight_summary(conn, tech, biz, client.flash_model, client.pro_model)
     conn.close()
 
     n_accepted = sum(1 for r in ledger_rows if r.status == 'accepted')
@@ -122,13 +124,13 @@ def main() -> None:
     logger.info('Done — %d findings: %d accepted, %d rejected, %d needs_review',
                 len(ledger_rows), n_accepted, n_rejected, n_review)
     logger.info('Summary confidence: %s', summary.get('overall_confidence', '?'))
-    if ds.get('headline'):
-        logger.info('DS:  %s', ds['headline'])
     if biz.get('headline'):
-        logger.info('Biz: %s', biz['headline'])
+        logger.info('Business: %s', biz['headline'])
+    if tech.get('headline'):
+        logger.info('Technical: %s', tech['headline'])
     logger.info('Log written to: logs/insights.log')
     logger.info('Next: uv run python data_quality.py')
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())

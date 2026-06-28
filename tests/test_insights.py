@@ -341,3 +341,16 @@ class TestLLMClient:
         from xai_forecast.insights.llm_client import DeepSeekClient
         with pytest.raises(RuntimeError, match='DEEPSEEK_API_KEY'):
             DeepSeekClient()
+
+    def test_async_methods_exist(self, monkeypatch):
+        """Both sync and async interfaces must be present on the client."""
+        import inspect
+        monkeypatch.setenv('DEEPSEEK_API_KEY', 'test-key')
+        from xai_forecast.insights.llm_client import DeepSeekClient
+        client = DeepSeekClient()
+        assert callable(client.call_flash)
+        assert callable(client.call_pro)
+        assert callable(client.acall_flash)
+        assert callable(client.acall_pro)
+        assert inspect.iscoroutinefunction(client.acall_flash)
+        assert inspect.iscoroutinefunction(client.acall_pro)

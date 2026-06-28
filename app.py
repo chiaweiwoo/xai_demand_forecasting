@@ -429,20 +429,55 @@ st.divider()
 st.markdown('<div class="section-kicker">What to do</div>', unsafe_allow_html=True)
 st.markdown('#### Recommended next steps')
 
+_BUCKET_LABEL = {
+    'feature_engineering': 'Feature engineering',
+    'model_param':         'Model parameters',
+    'workflow':            'Training workflow',
+    'algorithm':           'Algorithm',
+}
+_EFFORT_LABEL = {'low': 'Low effort', 'medium': 'Medium effort', 'high': 'High effort'}
+
 col_biz, col_ds = st.columns(2)
 
 with col_biz:
     with st.container(border=True):
         st.markdown('##### For the business')
-        if biz.get('summary'):
-            st.markdown(biz['summary'])
-        plan = biz.get('improvement_plan')
-        if plan:
-            st.markdown(f'**Plan:** {plan}')
+
+        # Progress block: health verdict + diagnosis
+        progress = biz.get('progress', {})
+        if progress.get('health_verdict'):
+            st.markdown(f"**Status:** {progress['health_verdict']}")
+        if progress.get('what_we_diagnosed'):
+            st.markdown(progress['what_we_diagnosed'])
+
+        # Phased plan
+        plan = biz.get('plan', {})
+        phases = plan.get('phases', [])
+        if phases:
+            st.markdown('**Improvement plan:**')
+            for phase in phases:
+                name   = phase.get('name', '')
+                action = phase.get('action', '')
+                risk   = phase.get('risk_if_skipped', '')
+                st.markdown(f'- **{name}:** {action}')
+                if risk:
+                    st.caption(f'Risk if skipped: {risk}')
+        if plan.get('expected_impact'):
+            st.caption(f"Expected impact: {plan['expected_impact']}")
+
         lims = biz.get('limitations', [])
         if lims:
             st.markdown('**Known limitations:**')
             for lim in lims:
+                st.markdown(f'- {lim}')
+
+        # Fallback for old format (summary / improvement_plan fields)
+        if not progress and not phases:
+            if biz.get('summary'):
+                st.markdown(biz['summary'])
+            if biz.get('improvement_plan'):
+                st.markdown(f"**Plan:** {biz['improvement_plan']}")
+            for lim in biz.get('limitations', []):
                 st.markdown(f'- {lim}')
 
 with col_ds:
@@ -450,10 +485,28 @@ with col_ds:
         st.markdown('##### For the data science team')
         if ds.get('summary'):
             st.markdown(ds['summary'])
-        actions = ds.get('recommended_actions', [])
-        if actions:
+
+        levers = ds.get('levers', [])
+        if levers:
+            st.markdown('**Improvement levers:**')
+            for bucket in ['feature_engineering', 'model_param', 'workflow', 'algorithm']:
+                bucket_levers = [lv for lv in levers if lv.get('bucket') == bucket]
+                if not bucket_levers:
+                    continue
+                st.markdown(f'**{_BUCKET_LABEL.get(bucket, bucket)}**')
+                for lv in bucket_levers:
+                    effort_tag = _EFFORT_LABEL.get(lv.get('effort', ''), '')
+                    change = lv.get('change', '')
+                    st.markdown(f'- {change}' + (f' *({effort_tag})*' if effort_tag else ''))
+                    if lv.get('evidence'):
+                        st.caption(f"Evidence: {lv['evidence']}")
+                    if lv.get('expected_effect'):
+                        st.caption(f"Expected: {lv['expected_effect']}")
+
+        # Fallback for old format (recommended_actions field)
+        elif ds.get('recommended_actions'):
             st.markdown('**Recommended actions:**')
-            for a in actions:
+            for a in ds.get('recommended_actions', []):
                 st.markdown(f'- {a}')
 
 st.caption(

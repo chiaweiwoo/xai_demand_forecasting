@@ -1,13 +1,16 @@
 """
 LLM steps for the insights pipeline.
 
-Four prompt constants (run /prompt-audit before editing):
-  PLANNER_PROMPT     -- Flash: decide which read-tools to call for this finding
-  HYPOTHESIS_PROMPT  -- Flash: interpret one evidence pack, write grounded hypothesis
-  CRITIC_PROMPT      -- Pro:   reject overclaim, forbid causal external claims, set confidence
-  SYNTHESIS_PROMPT   -- Flash: combine accepted findings into two-perspective summary
+Five prompt constants (run /prompt-audit before editing any of them):
+  PLANNER_PROMPT            -- Flash: decide which read-tools to call for this finding
+  HYPOTHESIS_PROMPT         -- Flash: interpret one evidence pack, write grounded hypothesis
+  CRITIC_PROMPT             -- Pro:   reject overclaim, enforce correlation-only for external signals
+  BUSINESS_SYNTHESIS_PROMPT -- Flash: VP-facing progress + phased plan (replaces SYNTHESIS_PROMPT)
+  TECHNICAL_SYNTHESIS_PROMPT -- Flash: DS-facing bucketed levers grounded in evidence
 
-Each function is a pure LLM call: takes evidence/text, returns a dict.
+Sync functions: run_planner, run_hypothesis, run_critic (kept for tests)
+Async functions: run_planner_async, run_hypothesis_async, run_critic_async,
+                 run_business_synthesis, run_technical_synthesis
 """
 
 from __future__ import annotations
@@ -98,44 +101,85 @@ Rules:
 - causal_external = true if the hypothesis says external signals CAUSED the error.
   If causal_external is true, status MUST be "rejected".
 - overclaim = true if hypothesis asserts facts not present in the evidence.
+- If `grounding_advisory` is present in the input and grounding_ok is false, treat it as one
+  signal that the hypothesis may cite non-existent evidence keys. Investigate the specific
+  missing_refs listed — but it is NOT an automatic reject criterion; use your judgment.
 - Before writing your JSON, re-read notes and confirm status is consistent:
   if notes identifies overclaim, overclaim must be true and status must not be "accepted".
 - Respond in English only."""
 
-SYNTHESIS_PROMPT = """\
-You are a senior AI/ML governance analyst writing an executive summary of accepted XAI findings
-for two audiences: a data scientist (what to fix) and a business leader (what it means).
+BUSINESS_SYNTHESIS_PROMPT = """\
+You are a senior governance analyst writing an executive model review for a VP of retail operations.
+Translate accepted XAI findings from a demand forecasting model into progress and plan language.
 
 Rules:
 - Use ONLY the accepted findings provided. Do NOT invent patterns not present in the findings.
 - Return valid JSON only — no markdown, no code fences:
-  {"data_scientist": {
-     "headline": "<15-20 word summary>",
-     "summary": "<3-4 sentences: root causes, model structural issues, concrete fixes>",
-     "top_issues": ["<issue 1>", "<issue 2>", "<issue 3>"],
-     "recommended_actions": ["<action 1>", "<action 2>", "<action 3>"]
+  {"headline": "<15-20 word board-ready summary of what was found>",
+   "progress": {
+     "health_verdict": "<1 sentence: is this model fit for purpose right now?>",
+     "what_we_diagnosed": "<2-3 sentences: what failure pattern was confirmed, plain English>",
+     "confidence": "<high|medium|low>"
    },
-   "business_leader": {
-     "headline": "<15-20 word summary suitable for a board update>",
-     "summary": "<3-4 sentences: what failed, risk direction, limitations, improvement plan>",
-     "risk_direction": "<over-stock|under-stock|mixed>",
-     "limitations": ["<limitation 1>", "<limitation 2>"],
-     "improvement_plan": "<2-3 sentences: what will be done and expected impact>"
+   "plan": {
+     "phases": [
+       {"name": "<Immediate|Short-term (1-3 months)|Medium-term (3-6 months)>",
+        "action": "<what will be done — specific enough for a non-technical stakeholder>",
+        "risk_if_skipped": "<one sentence: why this phase matters>"}
+     ],
+     "expected_impact": "<1 sentence: what measurable improvement the plan aims to deliver>"
    },
+   "limitations": ["<limitation 1>", "<limitation 2>"],
+   "risk_direction": "<over-stock|under-stock|mixed>",
    "overall_confidence": "<high|medium|low>"}
-- If n_accepted_findings is 0, return JSON with headline "No accepted findings cleared the quality gate",
-  summary "No patterns were confirmed by the critic.", top_issues/recommended_actions/limitations as [],
-  improvement_plan "Rerun with more backtest weeks.", risk_direction "mixed", overall_confidence "low".
-  Do NOT synthesize from rejected findings.
-- top_issues and recommended_actions: include up to 3 items — only what the evidence supports.
-  Do not pad to 3 if fewer are warranted.
-- For the business summary: state the risk direction (over-forecast = over-ordering risk),
-  avoid all model jargon (SHAP, log-margin, LightGBM), and focus on business impact.
-- For the data scientist summary: be specific — name the features, metrics, thresholds.
-- overall_confidence = high if >= 3 high-confidence findings; medium if 1-2; low otherwise.
-- Respond in English only.
-- Before writing final JSON, verify: (1) risk_direction matches the over/under-forecast evidence,
-  (2) DS summary mentions specific features, (3) business summary has no model jargon."""
+- Absolutely zero model jargon: do NOT use SHAP, LightGBM, WMAPE, z-score, log-margin, lag, rolling mean, Tweedie, or similar.
+- risk_direction: over-forecast = over-stock risk (we ordered too much). State this simply.
+- overall_confidence = high if >= 3 high-confidence findings accepted; medium if 1-2; low otherwise.
+- Plan must have 2-3 phases. Each phase action must be concrete — not "improve the model".
+- limitations: 1-3 items. Always include the analysis scope (one store, historical data 2011-2016 only).
+  State what else the analysis cannot tell us or what data is missing.
+- If n_accepted_findings is 0: health_verdict = "Insufficient evidence to assess",
+  overall_confidence = "low", phases = [{"name":"Immediate","action":"Extend the analysis period to gather more data","risk_if_skipped":"No basis for procurement or staffing decisions"}].
+- Before writing final JSON, verify: (1) zero model jargon in any field,
+  (2) risk_direction matches the over/under-forecast evidence in findings,
+  (3) each phase action is specific enough a non-technical stakeholder can act on it.
+- Respond in English only."""
+
+TECHNICAL_SYNTHESIS_PROMPT = """\
+You are a lead data scientist writing a technical model governance report for your team.
+Translate accepted XAI findings into a structured set of improvement levers.
+
+Rules:
+- Use ONLY the accepted findings provided. Do NOT invent patterns not present in the findings.
+- Return valid JSON only — no markdown, no code fences:
+  {"headline": "<15-20 word DS-facing technical summary>",
+   "summary": "<3-4 sentences: confirmed root causes, structural issues, what evidence shows>",
+   "levers": [
+     {"bucket": "<feature_engineering|model_param|workflow|algorithm>",
+      "change": "<specific, actionable change — name the exact feature, param, or process step>",
+      "evidence": "<cite the statistic from the findings that motivates this change>",
+      "expected_effect": "<what this change is expected to fix or measurably improve>",
+      "effort": "<low|medium|high>"}
+   ],
+   "overall_confidence": "<high|medium|low>"}
+- Bucket definitions:
+    feature_engineering  add, remove, or transform input features
+    model_param          change hyperparameters (objective, variance_power, num_leaves, learning_rate, etc.)
+    workflow             change training regime (window length, retrain frequency, pre-launch handling, etc.)
+    algorithm            switch model family (e.g. Croston/ADIDA for intermittent demand, ensemble, etc.)
+- Each lever must be specific. NOT "tune hyperparameters". INSTEAD:
+  "Reduce variance_power from 1.5 toward 1.0 — the Tweedie zero-inflation penalty is likely excessive
+   given 100% of bad weeks are over-forecasts, suggesting the model consistently overshoots demand."
+- evidence field: cite a specific number from the findings (e.g. "rolling_4_mean appears in 91% of SHAP payloads across all bad weeks").
+- Include 2-5 levers total. Do not pad — only include changes the evidence supports.
+- overall_confidence = high if >= 3 high-confidence findings accepted; medium if 1-2; low otherwise.
+- If n_accepted_findings is 0: headline = "No confirmed patterns to guide improvements",
+  summary = "Re-run the analysis with more backtest weeks before drawing conclusions.",
+  levers = [], overall_confidence = "low".
+- Before writing final JSON, verify: (1) every lever names a specific feature/param/process,
+  (2) every evidence field cites a number or statistic from the findings,
+  (3) no lever is generic advice that could apply to any ML model.
+- Respond in English only."""
 
 
 _VALID_TOOLS = {
@@ -149,13 +193,9 @@ _VALID_TOOLS = {
 }
 
 
-# ── Agent step functions ──────────────────────────────────────────────────────
+# ── Sync agent functions (kept for tests and fallback) ────────────────────────
 
-def run_planner(
-    client: DeepSeekClient,
-    finding: CandidateFinding,
-) -> list[str]:
-    """Flash: decide which read-tools to call for this finding. Returns a validated tool list."""
+def run_planner(client: DeepSeekClient, finding: CandidateFinding) -> list[str]:
     payload = {
         'finding_type': finding.finding_type,
         'score': finding.score,
@@ -166,13 +206,11 @@ def run_planner(
               finding.finding_type, finding.score, list(finding.evidence.keys()))
     result = client.call_flash(PLANNER_PROMPT, payload)
     log.debug('PLANNER raw response: %s', result)
-    chosen = result.get('tools', [])
-    rationale = result.get('rationale', '')
-    valid = [t for t in chosen if t in _VALID_TOOLS]
+    valid = [t for t in result.get('tools', []) if t in _VALID_TOOLS]
     if not valid:
         log.warning('PLANNER returned no valid tools, falling back to defaults')
         valid = ['read_forecast_accuracy', 'read_recurring_drivers']
-    log.info('PLANNER [%s] → %s | %s', finding.finding_type, valid, rationale)
+    log.info('PLANNER [%s] → %s | %s', finding.finding_type, valid, result.get('rationale', ''))
     return valid
 
 
@@ -181,7 +219,6 @@ def run_hypothesis(
     finding: CandidateFinding,
     enriched_evidence: dict[str, Any],
 ) -> Hypothesis:
-    """Flash: turn an evidence pack into a grounded hypothesis."""
     payload = {
         'finding_type': finding.finding_type,
         'summary': finding.summary,
@@ -202,8 +239,8 @@ def run_hypothesis(
         evidence_refs=result.get('evidence_refs', []),
         confidence=result.get('confidence', 'low'),
     )
-    log.info('HYPOTHESIS [%s] headline=%r confidence=%s refs=%s',
-             finding.finding_type, hyp.headline, hyp.confidence, hyp.evidence_refs)
+    log.info('HYPOTHESIS [%s] headline=%r confidence=%s',
+             finding.finding_type, hyp.headline, hyp.confidence)
     return hyp
 
 
@@ -214,19 +251,13 @@ def run_critic(
     enriched_evidence: dict[str, Any],
     grounding_advisory: dict[str, Any] | None = None,
 ) -> Critique:
-    """Pro: reject overclaim, enforce correlation-only for external signals.
-
-    grounding_advisory is optional context from the deterministic grounding check.
-    When present (grounding_ok=False), it flags refs Flash cited that don't map
-    to any evidence key — the critic uses this as one signal among many.
-    """
     payload = {
         'finding_type': finding.finding_type,
         'finding_summary': finding.summary,
         'evidence': enriched_evidence,
         'hypothesis': {
-            'headline':     hypothesis.headline,
-            'explanation':  json.loads(hypothesis.explanation) if hypothesis.explanation else {},
+            'headline':      hypothesis.headline,
+            'explanation':   json.loads(hypothesis.explanation) if hypothesis.explanation else {},
             'evidence_refs': hypothesis.evidence_refs,
             'confidence':    hypothesis.confidence,
         },
@@ -246,24 +277,123 @@ def run_critic(
         overclaim=bool(result.get('overclaim', False)),
         causal_external=bool(result.get('causal_external', False)),
     )
-    log.info('CRITIC [%s] status=%s confidence=%s overclaim=%s causal_external=%s notes=%r',
+    log.info('CRITIC [%s] status=%s confidence=%s overclaim=%s causal_external=%s',
              finding.finding_type, critique.status, critique.confidence,
-             critique.overclaim, critique.causal_external, critique.notes[:120])
+             critique.overclaim, critique.causal_external)
     return critique
 
 
-def run_synthesis(
+# ── Async agent functions (used by graph.py for concurrent fan-out) ───────────
+
+async def run_planner_async(client: DeepSeekClient, finding: CandidateFinding) -> list[str]:
+    payload = {
+        'finding_type': finding.finding_type,
+        'score': finding.score,
+        'summary': finding.summary,
+        'evidence_keys_available': list(finding.evidence.keys()),
+    }
+    log.debug('PLANNER input: finding_type=%s score=%.2f', finding.finding_type, finding.score)
+    result = await client.acall_flash(PLANNER_PROMPT, payload)
+    valid = [t for t in result.get('tools', []) if t in _VALID_TOOLS]
+    if not valid:
+        log.warning('PLANNER returned no valid tools, falling back to defaults')
+        valid = ['read_forecast_accuracy', 'read_recurring_drivers']
+    log.info('PLANNER [%s] → %s | %s', finding.finding_type, valid, result.get('rationale', ''))
+    return valid
+
+
+async def run_hypothesis_async(
+    client: DeepSeekClient,
+    finding: CandidateFinding,
+    enriched_evidence: dict[str, Any],
+) -> Hypothesis:
+    payload = {
+        'finding_type': finding.finding_type,
+        'summary': finding.summary,
+        'score': finding.score,
+        'evidence': enriched_evidence,
+    }
+    log.debug('HYPOTHESIS input keys: %s', list(enriched_evidence.keys()))
+    result = await client.acall_flash(HYPOTHESIS_PROMPT, payload)
+    hyp = Hypothesis(
+        finding_id=finding.finding_id,
+        headline=result.get('headline', ''),
+        explanation=json.dumps({
+            'ds_explanation':       result.get('ds_explanation', ''),
+            'business_explanation': result.get('business_explanation', ''),
+            'suggested_fix':        result.get('suggested_fix', ''),
+        }),
+        evidence_refs=result.get('evidence_refs', []),
+        confidence=result.get('confidence', 'low'),
+    )
+    log.info('HYPOTHESIS [%s] headline=%r confidence=%s',
+             finding.finding_type, hyp.headline, hyp.confidence)
+    return hyp
+
+
+async def run_critic_async(
+    client: DeepSeekClient,
+    finding: CandidateFinding,
+    hypothesis: Hypothesis,
+    enriched_evidence: dict[str, Any],
+    grounding_advisory: dict[str, Any] | None = None,
+) -> Critique:
+    payload = {
+        'finding_type': finding.finding_type,
+        'finding_summary': finding.summary,
+        'evidence': enriched_evidence,
+        'hypothesis': {
+            'headline':      hypothesis.headline,
+            'explanation':   json.loads(hypothesis.explanation) if hypothesis.explanation else {},
+            'evidence_refs': hypothesis.evidence_refs,
+            'confidence':    hypothesis.confidence,
+        },
+    }
+    if grounding_advisory is not None:
+        payload['grounding_advisory'] = grounding_advisory
+    log.debug('CRITIC input: headline=%r confidence=%s', hypothesis.headline, hypothesis.confidence)
+    result = await client.acall_pro(CRITIC_PROMPT, payload)
+    critique = Critique(
+        finding_id=finding.finding_id,
+        status=result.get('status', 'needs_review'),
+        confidence=result.get('confidence', 'low'),
+        notes=result.get('notes', ''),
+        overclaim=bool(result.get('overclaim', False)),
+        causal_external=bool(result.get('causal_external', False)),
+    )
+    log.info('CRITIC [%s] status=%s confidence=%s overclaim=%s causal_external=%s',
+             finding.finding_type, critique.status, critique.confidence,
+             critique.overclaim, critique.causal_external)
+    return critique
+
+
+async def run_business_synthesis(
     client: DeepSeekClient,
     accepted_findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Flash: combine accepted findings into a two-perspective summary."""
+    """Flash: VP-facing progress + phased plan."""
     payload = {
         'n_accepted_findings': len(accepted_findings),
         'findings': accepted_findings,
     }
-    log.debug('SYNTHESIS input: %d accepted findings', len(accepted_findings))
-    result = client.call_flash(SYNTHESIS_PROMPT, payload)
-    log.info('SYNTHESIS overall_confidence=%s', result.get('overall_confidence'))
-    log.debug('SYNTHESIS DS headline: %s', result.get('data_scientist', {}).get('headline'))
-    log.debug('SYNTHESIS Biz headline: %s', result.get('business_leader', {}).get('headline'))
+    log.debug('BUSINESS_SYNTHESIS input: %d accepted findings', len(accepted_findings))
+    result = await client.acall_flash(BUSINESS_SYNTHESIS_PROMPT, payload)
+    log.info('BUSINESS_SYNTHESIS overall_confidence=%s headline=%s',
+             result.get('overall_confidence'), result.get('headline', '')[:60])
+    return result
+
+
+async def run_technical_synthesis(
+    client: DeepSeekClient,
+    accepted_findings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Flash: DS-facing bucketed levers grounded in evidence."""
+    payload = {
+        'n_accepted_findings': len(accepted_findings),
+        'findings': accepted_findings,
+    }
+    log.debug('TECHNICAL_SYNTHESIS input: %d accepted findings', len(accepted_findings))
+    result = await client.acall_flash(TECHNICAL_SYNTHESIS_PROMPT, payload)
+    log.info('TECHNICAL_SYNTHESIS overall_confidence=%s levers=%d',
+             result.get('overall_confidence'), len(result.get('levers', [])))
     return result
