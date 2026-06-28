@@ -108,17 +108,39 @@ def main() -> None:
 
     all_ok &= _check('all bad weeks have shap + counterfactual', xai_types_ok)
 
-    # ── Payload JSON validity ─────────────────────────────────────────────────
+    # ── Payload JSON validity (full scan) ────────────────────────────────────
 
     bad_json = 0
-    sample_rows = conn.execute('SELECT payload FROM xai_results LIMIT 100').fetchall()
-    for (payload_str,) in sample_rows:
+    all_payload_rows = conn.execute('SELECT payload FROM xai_results').fetchall()
+    for (payload_str,) in all_payload_rows:
         try:
             json.loads(payload_str)
         except json.JSONDecodeError:
             bad_json += 1
-    all_ok &= _check('xai_results payloads are valid JSON (sample 100)', bad_json == 0,
-                     f'{bad_json} invalid')
+    all_ok &= _check(f'xai_results payloads are valid JSON (all {len(all_payload_rows):,} rows)',
+                     bad_json == 0, f'{bad_json} invalid')
+
+    # ── SHAP additivity check (post-full-run, sample 200) ────────────────────
+    shap_rows = conn.execute(
+        "SELECT payload FROM xai_results WHERE xai_type='shap' LIMIT 200"
+    ).fetchall()
+    n_additivity_fail = 0
+    import math
+    for (payload_str,) in shap_rows:
+        try:
+            p = json.loads(payload_str)
+            base = p.get('base_value_log')
+            pred = p.get('prediction')
+            top5_sum = sum(f['shap_value'] for f in p.get('top_features', []))
+            other = p.get('other_features_shap', 0.0)
+            if base is not None and pred is not None and pred > 0:
+                reconstructed = math.exp(base + top5_sum + other)
+                if abs(reconstructed - pred) / max(pred, 1e-6) > 0.01:  # 1% tolerance
+                    n_additivity_fail += 1
+        except Exception:
+            n_additivity_fail += 1
+    all_ok &= _check(f'SHAP additivity (sample {len(shap_rows)}): base+shap≈log(pred)',
+                     n_additivity_fail == 0, f'{n_additivity_fail} failed')
 
     # ── Features table ───────────────────────────────────────────────────────
 
@@ -163,13 +185,13 @@ def main() -> None:
             ).fetchone()[0]
             _check('at least 1 accepted finding', n_accepted > 0, f'{n_accepted} accepted')
             n_bad_json = 0
-            for (ev,) in conn.execute('SELECT evidence FROM insight_findings LIMIT 50').fetchall():
+            for (ev,) in conn.execute('SELECT evidence FROM insight_findings').fetchall():
                 try:
                     import json as _json
                     _json.loads(ev)
                 except Exception:
                     n_bad_json += 1
-            all_ok &= _check('insight_findings evidence is valid JSON', n_bad_json == 0, f'{n_bad_json} invalid')
+            all_ok &= _check('insight_findings evidence is valid JSON (all rows)', n_bad_json == 0, f'{n_bad_json} invalid')
     except Exception as exc:
         print(f'  {_WARN}  insight table check failed: {exc}')
 

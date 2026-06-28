@@ -58,10 +58,11 @@ def detect_over_forecast_bias(conn: sqlite3.Connection) -> CandidateFinding | No
         elif direction == 'under':
             under += 1
 
-    if total == 0:
+    directional = over + under  # payloads with actual > 0 where direction is defined
+    if directional == 0:
         return None
 
-    pct_over = over / total * 100
+    pct_over = over / directional * 100
     if pct_over < 70:
         return None
 
@@ -69,9 +70,10 @@ def detect_over_forecast_bias(conn: sqlite3.Connection) -> CandidateFinding | No
         finding_id='over_forecast_bias',
         finding_type='over_forecast_bias',
         score=pct_over / 100,
-        summary=f'{pct_over:.0f}% of bad-week forecasts are over-forecasts ({over}/{total} payloads)',
+        summary=f'{pct_over:.0f}% of bad-week forecasts are over-forecasts ({over}/{directional} directional payloads)',
         evidence={
             'total_payloads': total,
+            'directional_payloads': directional,
             'over_count': over,
             'under_count': under,
             'pct_over': round(pct_over, 1),
@@ -179,7 +181,7 @@ def detect_demand_cliff(conn: sqlite3.Connection) -> CandidateFinding | None:
                 'item_id': row['item_id'],
                 'lag_1_value': round(lag1_val, 2),
                 'actual': round(actual, 2),
-                'prediction': round(pred, 2) if pred else None,
+                'prediction': round(pred, 2) if pred is not None else None,
                 'cliff_ratio': round(lag1_val / actual, 1),
                 'signed_error_pct': p.get('signed_error'),
             })

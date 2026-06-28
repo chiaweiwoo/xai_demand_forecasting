@@ -58,7 +58,7 @@ class DeepSeekClient:
     def call_flash(self, system: str, user: dict | str, temperature: float = 0.2) -> dict:
         return self._call(self.flash_model, system, user, MAX_TOKENS_FLASH, temperature)
 
-    def call_pro(self, system: str, user: dict | str, temperature: float = 0.1) -> dict:
+    def call_pro(self, system: str, user: dict | str, temperature: float = 0.0) -> dict:
         return self._call(self.pro_model, system, user, MAX_TOKENS_PRO, temperature)
 
     def _call(
@@ -93,7 +93,7 @@ class DeepSeekClient:
     async def acall_flash(self, system: str, user: dict | str, temperature: float = 0.2) -> dict:
         return await self._acall(self.flash_model, system, user, MAX_TOKENS_FLASH, temperature)
 
-    async def acall_pro(self, system: str, user: dict | str, temperature: float = 0.1) -> dict:
+    async def acall_pro(self, system: str, user: dict | str, temperature: float = 0.0) -> dict:
         return await self._acall(self.pro_model, system, user, MAX_TOKENS_PRO, temperature)
 
     async def _acall(

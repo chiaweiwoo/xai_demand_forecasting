@@ -25,13 +25,13 @@ _CF_PERTURBATIONS = [
 ]
 
 
-def make_explainer(model: lgb.LGBMRegressor) -> shap.TreeExplainer:
+def make_explainer(model: lgb.Booster) -> shap.TreeExplainer:  # type: ignore[type-arg]
     return shap.TreeExplainer(model)
 
 
 def shap_payloads(
     explainer: shap.TreeExplainer,
-    model: lgb.LGBMRegressor,
+    model: lgb.Booster,
     week_df: pd.DataFrame,
     forecast_week: str,
     items: list[str],
@@ -95,7 +95,7 @@ def shap_payloads(
 
 
 def counterfactual_payloads(
-    model: lgb.LGBMRegressor,
+    model: lgb.Booster,
     week_df: pd.DataFrame,
     forecast_week: str,
     items: list[str],

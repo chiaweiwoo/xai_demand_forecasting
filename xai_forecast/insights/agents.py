@@ -103,18 +103,15 @@ Per-finding scope restrictions:
   recent sales history. Use: "the model is sensitive to recent trend changes" or "errors tend
   to coincide with this feature's dominance" — never "causes" or "drives" errors.
 - contrastive_gap: this is an ANALYSIS LIMITATION, not a demand pattern. business_explanation
-  must say which fraction of items lack a comparison week — nothing more.
+  must state only which fraction of items lack a seasonal comparison week — nothing more.
   NEVER say it "reduces reliability", "limits conclusions", or "affects ordering decisions".
-  The field says "states risk direction" — for contrastive_gap the correct risk direction is
-  "analysis limitation: no seasonal benchmark for X% of items". That is the full claim.
+  Do NOT frame it as a risk direction; it is purely a statement of analysis coverage.
 - counterfactual_material: the ONLY valid claim is model sensitivity.
   "Zeroing feature X changes the model's prediction by N% for M% of items" is correct.
   Do NOT cross-reference bad_weeks data to infer that SNAP or events coincide with high-error weeks.
   Do NOT claim the model was wrong because of SNAP activity. The evidence pack shows sensitivity,
   not which weeks were bad or why.
 
-- For over_forecast_bias or dominant_driver: state the risk direction explicitly
-  (e.g. "over-ordering risk", "excess inventory bias").
 - For demand_cliff: quote the actual lag_1 and actual sales numbers from the top example.
 - If evidence is absent or contradictory with no clear pattern, set confidence=low AND
   note the gap in ds_explanation — do not fabricate a direction.
@@ -226,8 +223,8 @@ Rules:
     workflow             change training regime (window length, retrain frequency, pre-launch handling, etc.)
     algorithm            switch model family (e.g. Croston/ADIDA for intermittent demand, ensemble, etc.)
 - Each lever must be specific. NOT "tune hyperparameters". INSTEAD:
-  "Reduce variance_power from 1.5 toward 1.0 — the Tweedie zero-inflation penalty is likely excessive
-   given 100% of bad weeks are over-forecasts, suggesting the model consistently overshoots demand."
+  "Reduce variance_power from 1.5 toward 1.0 if bad weeks show a systematic over-forecast bias,
+   citing the % of bad-week payloads that are over-forecasts from the findings."
 - evidence field: cite a specific number from the findings (e.g. "rolling_4_mean appears in 91% of SHAP payloads across all bad weeks").
 - Include 2-5 levers total. Do not pad — only include changes the evidence supports.
 - overall_confidence = high if >= 3 high-confidence findings accepted; medium if 1-2; low otherwise.
@@ -437,13 +434,13 @@ async def run_business_synthesis(
     client: DeepSeekClient,
     accepted_findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Flash: VP-facing progress + phased plan."""
+    """Flash: VP-facing progress + phased plan. temperature=0 for governance stability."""
     payload = {
         'n_accepted_findings': len(accepted_findings),
         'findings': accepted_findings,
     }
     log.debug('BUSINESS_SYNTHESIS input: %d accepted findings', len(accepted_findings))
-    result = await client.acall_flash(BUSINESS_SYNTHESIS_PROMPT, payload)
+    result = await client.acall_flash(BUSINESS_SYNTHESIS_PROMPT, payload, temperature=0.0)
     log.info('BUSINESS_SYNTHESIS overall_confidence=%s headline=%s',
              result.get('overall_confidence'), result.get('headline', '')[:60])
     return result
@@ -453,13 +450,13 @@ async def run_technical_synthesis(
     client: DeepSeekClient,
     accepted_findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Flash: DS-facing bucketed levers grounded in evidence."""
+    """Flash: DS-facing bucketed levers grounded in evidence. temperature=0 for governance stability."""
     payload = {
         'n_accepted_findings': len(accepted_findings),
         'findings': accepted_findings,
     }
     log.debug('TECHNICAL_SYNTHESIS input: %d accepted findings', len(accepted_findings))
-    result = await client.acall_flash(TECHNICAL_SYNTHESIS_PROMPT, payload)
+    result = await client.acall_flash(TECHNICAL_SYNTHESIS_PROMPT, payload, temperature=0.0)
     log.info('TECHNICAL_SYNTHESIS overall_confidence=%s levers=%d',
              result.get('overall_confidence'), len(result.get('levers', [])))
     return result
