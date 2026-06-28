@@ -16,7 +16,7 @@ except ImportError:
     _AsyncOpenAI = None   # type: ignore[assignment,misc]
     _OPENAI_AVAILABLE = False
 
-MAX_TOKENS_FLASH  = 2000
+MAX_TOKENS_FLASH  = 3000
 MAX_TOKENS_PRO    = 4096
 
 
@@ -81,7 +81,12 @@ class DeepSeekClient:
         if choice.finish_reason == 'length':
             logger.warning('Response truncated (finish_reason=length, model=%s)', model)
         raw = choice.message.content or '{}'
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except Exception as exc:
+            logger.error('JSON parse failed (model=%s finish_reason=%s): %s — raw: %s…',
+                         model, choice.finish_reason, exc, raw[:300])
+            return {}
 
     # ── Async interface (used by graph.py for concurrent fan-out) ─────────────
 
@@ -111,4 +116,9 @@ class DeepSeekClient:
         if choice.finish_reason == 'length':
             logger.warning('Response truncated (finish_reason=length, model=%s)', model)
         raw = choice.message.content or '{}'
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except Exception as exc:
+            logger.error('JSON parse failed (model=%s finish_reason=%s): %s — raw: %s…',
+                         model, choice.finish_reason, exc, raw[:300])
+            return {}

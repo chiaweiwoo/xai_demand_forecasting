@@ -357,6 +357,11 @@ async def run_hypothesis_async(
     }
     log.debug('HYPOTHESIS input keys: %s', list(enriched_evidence.keys()))
     result = await client.acall_flash(HYPOTHESIS_PROMPT, payload)
+    log.debug('HYPOTHESIS [%s] body: ds=%r biz=%r fix=%r',
+              finding.finding_type,
+              result.get('ds_explanation', '')[:200],
+              result.get('business_explanation', '')[:200],
+              result.get('suggested_fix', '')[:100])
     hyp = Hypothesis(
         finding_id=finding.finding_id,
         headline=result.get('headline', ''),
@@ -393,8 +398,11 @@ async def run_critic_async(
     }
     if grounding_advisory is not None:
         payload['grounding_advisory'] = grounding_advisory
-    log.debug('CRITIC input: headline=%r confidence=%s', hypothesis.headline, hypothesis.confidence)
+    log.debug('CRITIC input: headline=%r confidence=%s grounding_ok=%s',
+              hypothesis.headline, hypothesis.confidence,
+              grounding_advisory.get('grounding_ok') if grounding_advisory else 'n/a')
     result = await client.acall_pro(CRITIC_PROMPT, payload)
+    log.debug('CRITIC [%s] raw: %s', finding.finding_type, result)
     critique = Critique(
         finding_id=finding.finding_id,
         status=result.get('status', 'needs_review'),
