@@ -66,11 +66,16 @@ Rules:
 - Return valid JSON only — no markdown, no code fences:
   {"headline": "<15-20 word summary>",
    "ds_explanation": "<2-3 sentences for a data scientist — technical, concrete, cites numbers>",
-   "business_explanation": "<2-3 sentences for a business leader — plain English, no jargon, states risk direction>",
+   "business_explanation": "<2-3 sentences: what was observed in plain English, numbers only — no risk inference, no business consequence>",
    "evidence_refs": ["<field names from the evidence you relied on>"],
-   "suggested_fix": "<one concrete, actionable recommendation for the data scientist>",
+   "suggested_fix": "<the technical change to make — what to add, remove, or modify in the model or pipeline. State the change only, not the expected outcome>",
    "confidence": "<high|medium|low>"}
 - confidence = high if n evidence rows >= 10 and pattern is unambiguous; medium if 3-9; low if < 3.
+- business_explanation and suggested_fix: PURELY DESCRIPTIVE. Do NOT state business risk
+  ("over-ordering risk", "inventory risk", "volatility"), do NOT infer consequences
+  ("leads to over-forecasting", "could introduce volatility"), do NOT use normative language
+  ("over-relying", "insufficient"). State WHAT the model does and WHAT to change — nothing more.
+  Risk and business consequence language is handled by the synthesis stage, not here.
 
 CRITICAL — model behaviour vs. real-world causation (the most common rejection reason):
 - SHAP values and feature importance describe what the MODEL uses internally — not why demand moved.
@@ -114,8 +119,9 @@ Per-finding scope restrictions:
 - If evidence is absent or contradictory with no clear pattern, set confidence=low AND
   note the gap in ds_explanation — do not fabricate a direction.
 - Before writing final JSON, verify: (1) every number came from the evidence JSON,
-  (2) no causal claim anywhere — model sensitivity only, (3) suggested_fix is actionable,
-  (4) for dominant_driver: no "cause" or "lead to" language in business_explanation,
+  (2) no causal claim anywhere — model sensitivity only,
+  (3) business_explanation contains no risk inference or normative language,
+  (4) suggested_fix states only the technical change, not its expected outcome,
   (5) for contrastive_gap: no reliability or ordering consequence stated,
   (6) for counterfactual_material: no bad-week coincidence claimed.
 - Respond in English only."""
