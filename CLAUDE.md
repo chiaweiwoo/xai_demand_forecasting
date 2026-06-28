@@ -198,14 +198,20 @@ Findings from full-run analysis (120 backtest weeks, 16 bad weeks, 800 SHAP payl
 
 ## Dashboard
 
-Single-page layout (top → bottom):
+`app.py` is a management-facing storytelling page (`layout='centered'`), built to read as a briefing top→bottom and earn attention in the first screen. All hero copy is **data-bound** — it pulls live from `insight_summary` + `insight_findings`, degrading gracefully if a finding is absent. Cache loaders use `ttl=300` so a fresh `generate_insights.py` run shows up rather than serving a stale empty result.
 
 | Section | What it shows |
 |---|---|
-| Model Performance | Weekly MAPE time series with bad-week markers + 4 KPI tiles |
-| Insights Summary | Two-column: Data Scientist view (issues, actions) + Business Leader view (risk direction, limitations, improvement plan) |
-| Findings Ledger | Dataframe of all findings with status/confidence badges; selectbox to inspect evidence + hypothesis |
-| XAI Drill-Down | Pick bad week + item → SHAP waterfall, Counterfactual bar chart, Contrastive grouped bar |
+| Hero (verdict) | Bold one-line verdict (= synthesis business headline) + risk badge (over/under/mixed) + overall confidence + 3 live "so what" tiles (bad-week count, % over-forecast, plain-English root cause) |
+| What am I looking at? | Dataset (M5 Walmart CA_1, ~3k products, 2011–2016), the core question, the 4-step approach ribbon |
+| How we flag a bad week | Plain-language definition (spike vs chronic error) + MAPE time series with bad-week markers |
+| What we found | Accepted findings as story cards (plain title + business explanation + confidence), strongest first; rejected findings shown as an honest "we tested, evidence didn't hold" footnote |
+| What to do | Two columns: business recommendations (summary, improvement plan, limitations) + DS recommendations (summary, actions) |
+| Technical evidence | `st.toggle` (off by default): findings ledger + per-item SHAP / counterfactual / contrastive drill-down. A toggle, not an expander, to avoid nested-expander errors |
+
+**`overall_confidence` persistence:** the synthesis returns `overall_confidence` as a top-level key, but `insert_insight_summary` only stores the `data_scientist` + `business_leader` dicts. `generate_insights.py` folds `overall_confidence` into both dicts before insert so the hero can read it back.
+
+Finding-type → plain card titles and feature → plain-English names live in `app.py` (`_FINDING_TITLE`, `_FEATURE_PLAIN`). All ML jargon (SHAP, log-margin, Tweedie) is confined to the technical-evidence appendix.
 
 ## Stack
 

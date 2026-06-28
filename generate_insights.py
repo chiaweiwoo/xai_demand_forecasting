@@ -107,6 +107,11 @@ def main() -> None:
 
     ds  = summary.get('data_scientist', {})
     biz = summary.get('business_leader', {})
+    # overall_confidence is a top-level synthesis key — fold it into both perspective
+    # dicts so it survives persistence (insert_insight_summary stores only these two).
+    overall_conf = summary.get('overall_confidence', 'medium')
+    ds.setdefault('overall_confidence', overall_conf)
+    biz.setdefault('overall_confidence', overall_conf)
     insert_insight_summary(conn, ds, biz, client.flash_model, client.pro_model)
     conn.close()
 
