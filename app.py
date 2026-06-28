@@ -104,6 +104,29 @@ def _insight_findings():
 
 
 @st.cache_data(ttl=300)
+def _direction_stats() -> dict:
+    """Count over/under forecasts across all bad-week SHAP payloads."""
+    import json as _json
+    with get_conn(DB_PATH) as conn:
+        rows = conn.execute(
+            """SELECT xr.payload
+               FROM xai_results xr
+               JOIN evaluations e ON e.week_id = xr.week_id AND e.item_id = xr.item_id
+               WHERE xr.xai_type = 'shap' AND e.is_bad_week = 1"""
+        ).fetchall()
+    over = under = 0
+    for (payload,) in rows:
+        d = _json.loads(payload).get('direction')
+        if d == 'over':
+            over += 1
+        elif d == 'under':
+            under += 1
+    total = over + under
+    return {'over': over, 'under': under, 'total': total,
+            'pct_over': round(over / total * 100, 1) if total else None}
+
+
+@st.cache_data(ttl=300)
 def _actual_vs_forecast():
     with get_conn(DB_PATH) as conn:
         return pd.read_sql(
@@ -252,6 +275,12 @@ pct_over = None
 if over_f:
     pct_over = (over_f.get('evidence') or {}).get('pct_over')
 
+# Fallback: compute direction directly from DB if the detector didn't fire
+_dir_stats = _direction_stats()
+if pct_over is None and _dir_stats.get('pct_over') is not None:
+    pct_over = _dir_stats['pct_over']
+_dir_lopsided = pct_over is not None and (pct_over >= 70 or pct_over <= 30)
+
 root_cause = None
 if driver_f:
     dom = (driver_f.get('evidence') or {}).get('dominant_features') or []
@@ -268,9 +297,16 @@ with t1:
     )
 with t2:
     if pct_over is not None:
+        _tile_color = ACCENT_OVER if _dir_lopsided else INK
+        _under_pct = round(100 - pct_over, 1)
+        _lbl = (
+            'of bad-week forecasts were<br>over-forecasts'
+            if _dir_lopsided
+            else f'{_under_pct:.0f}% under · direction is mixed'
+        )
         st.markdown(
-            f'<div class="tile-num" style="color:{ACCENT_OVER}">{pct_over:.0f}%</div>'
-            f'<div class="tile-lbl">of bad weeks were<br>over-forecasts (never under)</div>',
+            f'<div class="tile-num" style="color:{_tile_color}">{pct_over:.0f}%</div>'
+            f'<div class="tile-lbl">over-forecast<br>{_lbl}</div>',
             unsafe_allow_html=True,
         )
     else:
