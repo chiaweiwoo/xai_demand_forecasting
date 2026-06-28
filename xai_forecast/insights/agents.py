@@ -88,12 +88,15 @@ CRITICAL — model behaviour vs. real-world causation (the most common rejection
   Say "coincided with" or "occurred during" — never "caused by" or "due to".
 
 Per-finding scope restrictions:
-- dominant_driver: business_explanation must state which feature appears most often (name it,
-  give the percentage) and note that the model leans heavily on recent sales history.
-  Use association language: "when recent sales shift sharply, errors tend to follow" or
-  "the model is sensitive to recent trend changes".
-  NEVER say recent sales "cause" forecast errors or "lead to" over-/under-forecasting.
-  There is no causal experiment in the evidence — state the correlation only.
+- dominant_driver: ALL fields must use frequency/correlation language only.
+  headline must follow this pattern: "[feature] appears in X% of bad-week SHAP payloads,
+  dominating model predictions across Y bad weeks."
+  NEVER use "drives", "causes", "leads to errors", or "responsible for errors" in headline
+  or any explanation field — these are causal claims. The evidence is frequency of appearance
+  in SHAP payloads; state that, nothing more.
+  business_explanation: state which feature appears most often and that the model leans on
+  recent sales history. Use: "the model is sensitive to recent trend changes" or "errors tend
+  to coincide with this feature's dominance" — never "causes" or "drives" errors.
 - contrastive_gap: this is an ANALYSIS LIMITATION, not a demand pattern. business_explanation
   must say which fraction of items lack a comparison week — nothing more.
   NEVER say it "reduces reliability", "limits conclusions", or "affects ordering decisions".
