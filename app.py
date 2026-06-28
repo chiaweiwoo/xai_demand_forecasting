@@ -103,6 +103,21 @@ def _insight_findings():
         return load_insight_findings(conn)
 
 
+@st.cache_data(ttl=300)
+def _actual_vs_forecast():
+    with get_conn(DB_PATH) as conn:
+        return pd.read_sql(
+            '''SELECT f.week_id,
+                      SUM(f.h1)  AS total_forecast,
+                      SUM(ws.y)  AS total_actual
+               FROM forecasts f
+               JOIN weekly_sales ws ON ws.week = f.week_id AND ws.unique_id = f.item_id
+               GROUP BY f.week_id
+               ORDER BY f.week_id''',
+            conn,
+        )
+
+
 def _xai(week_id: str, item_id: str) -> dict[str, dict]:
     with get_conn(DB_PATH) as conn:
         rows = load_xai(conn, week_id, item_id)
@@ -314,34 +329,54 @@ st.markdown('<div class="section-kicker">How we decide a week is "bad"</div>', u
 st.markdown('#### Not just high error — an *unusual spike* in error')
 
 st.markdown(
-    'A product that is always 30% off isn\'t news. A week where the error jumps from its '
-    'recent normal of ~10% up to 40% **is**. We flag a week only when its forecast error '
-    'spikes well above that store\'s own recent track record — so we catch genuine surprises, '
-    'not chronic noise.'
+    'A product that is always 30% off isn\'t news. A week where the error *spikes far above '
+    'its own recent track record* **is**. We flag a week only when the forecast diverges '
+    'unusually from actual sales — so we catch genuine surprises, not chronic noise.'
 )
+
+avf = _actual_vs_forecast()
+avf['week_dt'] = pd.to_datetime(avf['week_id'])
 
 summary_plot = summary.copy()
 summary_plot['week_dt'] = pd.to_datetime(summary_plot['week_id'])
-bad = summary_plot[summary_plot['n_bad_items'] > 0]
+bad_weeks_set = set(summary_plot[summary_plot['n_bad_items'] > 0]['week_id'])
 
 fig = go.Figure()
+
+# Shade bad weeks as vertical rectangles
+for bw in sorted(bad_weeks_set):
+    bw_dt = pd.to_datetime(bw)
+    fig.add_vrect(
+        x0=bw_dt - pd.Timedelta(days=3),
+        x1=bw_dt + pd.Timedelta(days=3),
+        fillcolor=ACCENT_OVER, opacity=0.12,
+        line_width=0,
+    )
+
 fig.add_trace(go.Scatter(
-    x=summary_plot['week_dt'], y=summary_plot['avg_mape'],
-    mode='lines', name='Weekly error', line=dict(color='#888', width=1.4),
+    x=avf['week_dt'], y=avf['total_actual'],
+    mode='lines', name='Actual sales',
+    line=dict(color='#2c7bb6', width=2),
 ))
 fig.add_trace(go.Scatter(
-    x=bad['week_dt'], y=bad['avg_mape'],
-    mode='markers', name='Flagged bad week',
-    marker=dict(color=ACCENT_OVER, size=9, symbol='x-thin', line=dict(width=2)),
+    x=avf['week_dt'], y=avf['total_forecast'],
+    mode='lines', name='Forecast',
+    line=dict(color='#888', width=1.6, dash='dot'),
 ))
 fig.update_layout(
-    xaxis_title=None, yaxis_title='Avg error (%)',
-    hovermode='x unified', height=300,
+    xaxis_title=None,
+    yaxis_title='Total weekly units (store-wide)',
+    hovermode='x unified',
+    height=320,
     margin=dict(t=10, b=10, l=10, r=10),
     legend=dict(orientation='h', yanchor='bottom', y=1.0, xanchor='left', x=0),
 )
 st.plotly_chart(fig, width='stretch')
-st.caption(f'{n_bad_weeks} of {n_total_weeks} reviewed weeks were flagged (red ✕).')
+st.caption(
+    f'Blue = actual sales, grey dashed = model forecast. '
+    f'Red bands = the {n_bad_weeks} flagged bad weeks (out of {n_total_weeks} reviewed). '
+    'A week is flagged when the forecast-vs-actual gap spikes unusually against the model\'s own recent track record.'
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
