@@ -67,7 +67,7 @@ SECTIONS = [
     '📦  Data Layer',
     '🤖  ML Pipeline',
     '🔍  XAI Engine',
-    '💬  LLM Narrative',
+    '💬  Insights Module',
     '⚙️  Orchestration',
     '🗄️  Storage',
     '📊  Dashboard',
@@ -75,14 +75,14 @@ SECTIONS = [
 section = st.sidebar.radio('Navigate', SECTIONS, label_visibility='collapsed')
 
 COLORS = {
-    '🗺️  Overview':      '#1a73e8',
-    '📦  Data Layer':    '#1565c0',
-    '🤖  ML Pipeline':   '#2e7d32',
-    '🔍  XAI Engine':    '#e65100',
-    '💬  LLM Narrative': '#6a1b9a',
-    '⚙️  Orchestration': '#37474f',
-    '🗄️  Storage':       '#00695c',
-    '📊  Dashboard':     '#0277bd',
+    '🗺️  Overview':       '#1a73e8',
+    '📦  Data Layer':     '#1565c0',
+    '🤖  ML Pipeline':    '#2e7d32',
+    '🔍  XAI Engine':     '#e65100',
+    '💬  Insights Module':'#6a1b9a',
+    '⚙️  Orchestration':  '#37474f',
+    '🗄️  Storage':        '#00695c',
+    '📊  Dashboard':      '#0277bd',
 }
 
 st.sidebar.markdown('---')
@@ -91,8 +91,8 @@ st.sidebar.markdown(
     '- 📦 Data → features table\n'
     '- 🤖 ML → forecasts + bad-week flags\n'
     '- 🔍 XAI → SHAP / CF / contrastive\n'
-    '- 💬 LLM → plain-English narratives\n'
-    '- 📊 Dashboard → leader view'
+    '- 💬 LLM → insights (detectors → planner → critic)\n'
+    '- 📊 Dashboard → single-page insights view'
 )
 
 
@@ -139,17 +139,18 @@ if section == '🗺️  Overview':
 &nbsp;&nbsp;&nbsp;&nbsp;→ <b>xai.py / Counterfactual</b>: zero out SNAP/event/price → measure prediction delta<br>
 &nbsp;&nbsp;&nbsp;&nbsp;→ <b>xai.py / Contrastive</b>: diff SHAP vs a good same-WOY reference week<br>
 
-<br><b style="color:#6a1b9a">LLM LAYER</b><br>
-&nbsp;&nbsp;<b>narrate.py</b>: dossier builders (pure) → DeepSeek V4 Flash (OpenAI SDK)<br>
-&nbsp;&nbsp;&nbsp;&nbsp;→ Week narrative · Item narrative · Executive synthesis<br>
-&nbsp;&nbsp;&nbsp;&nbsp;→ Grounding check: primary_driver must exist in evidence features<br>
+<br><b style="color:#6a1b9a">INSIGHTS LAYER</b><br>
+&nbsp;&nbsp;<b>generate_insights.py</b>: deterministic detectors → LangGraph fan-out<br>
+&nbsp;&nbsp;&nbsp;&nbsp;→ per-finding: planner (Flash) → enrich evidence → hypothesis (Flash) → grounding advisory → critic (Pro)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;→ fan-in: synthesis (Flash) → DS view + business view<br>
+&nbsp;&nbsp;&nbsp;&nbsp;→ Logs full agent trace to logs/insights.log<br>
 
 <br><b style="color:#00695c">STORAGE</b><br>
-&nbsp;&nbsp;<b>db.py</b>: SQLite (WAL mode) — 9 tables, schema auto-applied via 4 migrations<br>
-&nbsp;&nbsp;All writes are INSERT OR REPLACE — backtest is idempotent, re-runnable<br>
+&nbsp;&nbsp;<b>db.py</b>: SQLite (WAL mode) — 10 tables, schema auto-applied via 7 migrations<br>
+&nbsp;&nbsp;All writes are INSERT OR REPLACE — pipeline is idempotent, re-runnable<br>
 
 <br><b style="color:#0277bd">DASHBOARD</b><br>
-&nbsp;&nbsp;<b>app.py</b>: Streamlit — 4 pages: Overview · Bad Week Drilldown · Recurring Drivers · XAI Explorer<br>
+&nbsp;&nbsp;<b>app.py</b>: Streamlit — single-page: MAPE chart · Insights summary · Findings ledger · XAI drill-down<br>
 </div>
 ''',
         unsafe_allow_html=True,
@@ -445,120 +446,206 @@ elif section == '🔍  XAI Engine':
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — LLM NARRATIVE
+# SECTION 5 — INSIGHTS MODULE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-elif section == '💬  LLM Narrative':
-    _header('💬 LLM Narrative', 'narrate.py — DeepSeek V4 Flash + grounding check', COLORS[section])
+elif section == '💬  Insights Module':
+    _header(
+        '💬 Insights Module',
+        'xai_forecast/insights/ — detectors → planner → hypothesis → critic → synthesis',
+        COLORS[section],
+    )
 
-    narrate_src = _read('xai_forecast/narrate.py')
+    graph_src     = _read('xai_forecast/insights/graph.py')
+    detectors_src = _read('xai_forecast/insights/detectors.py')
+    agents_src    = _read('xai_forecast/insights/agents.py')
+    tools_src     = _read('xai_forecast/insights/tools.py')
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         'Architecture',
-        'Dossier builders',
-        'generate() + grounding',
+        'Detectors',
+        'Planner + tools',
+        'Critic + grounding',
         'Prompt constants',
     ])
 
     with tab1:
-        st.markdown('#### How the three narrative types relate')
+        st.markdown('#### Evidence-first design philosophy')
+        _note(
+            '<b>Deterministic detectors fire first</b> — they surface candidate findings from real data thresholds. '
+            'The LLM never sees raw DB rows directly; it only sees the bounded evidence pack each detector assembled.<br><br>'
+            '<b>LLM interprets, not discovers</b> — Flash writes hypotheses, Pro critiques them. '
+            'The critic is the single quality gate. A deterministic grounding advisory is forwarded to the critic '
+            'as context but does not gate or mutate confidence.',
+            border='#6a1b9a',
+        )
+
+        st.markdown('#### LangGraph flow')
         st.markdown(
             '''
 <div style="background:#f3e5f5;padding:16px 20px;border-radius:8px;font-size:0.85rem;line-height:2">
-<b>Week narrative</b> (scope=week, key=forecast_week)<br>
-&nbsp;&nbsp;→ build_week_dossier: aggregated SHAP across top-50 SKUs<br>
-&nbsp;&nbsp;→ WEEK_NARRATIVE_PROMPT → "Recent sales trend shifted unexpectedly this week…"<br>
+<b>detect_candidates</b> (deterministic, no LLM)<br>
+&nbsp;&nbsp;→ run_all_detectors(conn) → list[CandidateFinding]<br>
 <br>
-<b>Item narrative</b> (scope=item, key=week::item_id)<br>
-&nbsp;&nbsp;→ build_item_dossier: SHAP + CF + contrastive for one SKU<br>
-&nbsp;&nbsp;→ ITEM_NARRATIVE_PROMPT → "This product was over-forecast by 40%…"<br>
+<b>fan-out via Send()</b> — one review_finding node per candidate<br>
 <br>
-<b>Executive narrative</b> (scope=executive, key=overall)<br>
-&nbsp;&nbsp;→ build_executive_dossier: recurring driver frequencies across ALL bad weeks<br>
-&nbsp;&nbsp;→ EXECUTIVE_NARRATIVE_PROMPT → "Across 15 bad weeks, lag features dominated failures…"<br>
+<b>review_finding</b> (per-finding):<br>
+&nbsp;&nbsp;1. run_planner(Flash) → choose 1-4 read-tools<br>
+&nbsp;&nbsp;2. _enrich_evidence(conn, tools) → merge read-tool results into evidence dict<br>
+&nbsp;&nbsp;3. run_hypothesis(Flash) → grounded hypothesis with evidence_refs<br>
+&nbsp;&nbsp;4. grounding advisory → check refs against enriched keys; forward to critic<br>
+&nbsp;&nbsp;5. run_critic(Pro) → accepted / rejected / needs_review<br>
+<br>
+<b>fan-in: ledger_rows (Annotated[list, add] reducer)</b><br>
+<br>
+<b>synthesize</b>:<br>
+&nbsp;&nbsp;→ filter accepted findings → run_synthesis(Flash) → DS view + business view<br>
+&nbsp;&nbsp;→ stored in insight_summary table<br>
 </div>
 ''',
             unsafe_allow_html=True,
         )
 
-        st.markdown('#### Dossier → LLM flow')
+        st.markdown('#### StateGraph + closure factory')
         _note(
-            '1. <b>Dossier builder</b> (pure function, no network) — assembles evidence JSON from DB rows.<br>'
-            '2. <b>generate()</b> — sends (system_prompt, dossier) to DeepSeek, gets JSON back.<br>'
-            '3. <b>Grounding check</b> — validates primary_driver is in the evidence feature list.<br>'
-            '4. <b>Store</b> — insert_narrative(scope, key, payload) → narratives table.',
+            '<code>_State(TypedDict)</code> — three keys: <code>candidates</code>, '
+            '<code>ledger_rows: Annotated[list, add]</code>, <code>summary</code>.<br><br>'
+            '<b>Fan-in reducer</b>: <code>Annotated[list, add]</code> on <code>ledger_rows</code> '
+            'means each <code>review_finding</code> node appends its <code>LedgerRow</code> rather than '
+            'overwriting — no manual state merging needed.<br><br>'
+            '<b>Closure factory</b>: <code>_build_graph(conn, client)</code> captures <code>conn</code> and '
+            '<code>client</code> in node-function closures — they never enter the LangGraph state dict. '
+            'This avoids <code>KeyError</code> when LangGraph passes only the node-output delta to edge routers, '
+            'and keeps state serialisation-safe.',
             border='#6a1b9a',
         )
+        _file_badge('xai_forecast/insights/graph.py — _State + _build_graph')
+        st.code(_excerpt(graph_src, 108, 140), language='python')
 
     with tab2:
-        st.markdown('#### build_week_dossier — aggregates SHAP across all items in a bad week')
-        st.code(_excerpt(narrate_src, 100, 141), language='python')
-
-        st.markdown('#### compute_recurring_drivers — cross-week frequency analysis')
+        st.markdown('#### Six deterministic detectors — fire before any LLM call')
         _note(
-            'Single source of truth used by both <code>backtest.py</code> (executive narrative) and '
-            '<code>app.py</code> (Recurring Drivers page).<br><br>'
-            'Returns per-feature: <code>count</code>, <code>pct_payloads</code> (% of all SHAP explanations), '
-            '<code>n_weeks</code>, <code>pct_bad_weeks</code> (% of distinct bad weeks).<br><br>'
-            '<b>pct_payloads vs pct_bad_weeks</b>: different denominators. '
-            'pct_payloads counts SKU explanations (a feature at 80% appeared in 80% of top-50 slots). '
-            'pct_bad_weeks counts distinct weeks (80% = feature appeared in 80% of all flagged weeks). '
-            'The executive prompt uses pct_bad_weeks for confidence thresholding.',
+            'Each detector reads from SQLite directly (no LLM). '
+            'Fires only when evidence meets a real-data threshold. '
+            'Returns a <code>CandidateFinding</code> (finding_type, score 0-1, summary, evidence dict) '
+            'or <code>None</code> if the threshold is not met.',
             border='#6a1b9a',
         )
-        st.code(_excerpt(narrate_src, 188, 224), language='python')
+
+        detectors_table = {
+            'over_forecast_bias': ('70% of SHAP payloads must be over-forecasts', 'Systematic bias: risk is over-ordering, not stockouts'),
+            'dominant_driver': ('One feature in >60% of SHAP payloads', 'Model over-anchors on one feature across bad weeks'),
+            'demand_cliff': ('lag_1 ≥ 3× actual for ≥3 items', 'Momentum over-anchoring: sales dropped after model anchored on high lag_1'),
+            'external_coincidence': ('Bad week + heat wave / gas spike / sentiment crisis', 'Correlation with external conditions (stated as correlation only)'),
+            'counterfactual_material': ('Zeroing SNAP/event/price moves prediction >5%', 'Feature was causally active and quantifiably affected the forecast'),
+            'contrastive_gap': ('Always fires if contrastive data exists', 'Structural SHAP diff vs same-WOY good reference week'),
+        }
+        for det, (threshold, interpretation) in detectors_table.items():
+            with st.expander(f'**{det}** — threshold: {threshold}'):
+                st.markdown(f'**Interpretation:** {interpretation}')
+
+        st.markdown('#### Example — detect_over_forecast_bias')
+        _file_badge('xai_forecast/insights/detectors.py')
+        st.code(_excerpt(detectors_src, 44, 80), language='python')
+
+        st.markdown('#### run_all_detectors — sorted by score descending')
+        st.code(_excerpt(detectors_src, 390, 409), language='python')
 
     with tab3:
-        _file_badge('xai_forecast/narrate.py — DeepSeekNarrator.generate()')
-        col1, col2 = st.columns([3, 2])
-        with col1:
-            st.code(_excerpt(narrate_src, 20, 29), language='python')
-            st.code(_excerpt(narrate_src, 265, 329), language='python')
-        with col2:
-            st.markdown('#### MAX_NARRATIVE_TOKENS')
-            _note(
-                '<code>MAX_NARRATIVE_TOKENS = 800</code> — generous 4× margin above worst-case schema output (~200 tokens). '
-                'Named constant so it\'s easy to find and raise if the warning fires.<br><br>'
-                'If the API truncates the response, <code>finish_reason == "length"</code> is detected '
-                '<i>before</i> attempting json.loads — avoiding a cryptic JSONDecodeError. '
-                'Returns None with an actionable log message.',
-                border='#6a1b9a',
-            )
-            st.markdown('#### Graceful no-key fallback')
-            _note(
-                'If <code>DEEPSEEK_API_KEY</code> is not set, <code>self._client</code> stays None. '
-                '<code>generate()</code> returns None immediately. '
-                'The dashboard falls back to charts-only, no errors.',
-                border='#6a1b9a',
-            )
-            st.markdown('#### Grounding check')
-            _note(
-                'After parsing the JSON, validates that <code>primary_driver</code> is in the dossier\'s <code>features</code> list. '
-                'If not: sets <code>confidence="low"</code> and <code>grounding_warning=True</code>. '
-                'Does NOT validate body text or numbers — low temperature (0.2) + prompt rules handle those.',
-                border='#6a1b9a',
-            )
-            _note(
-                '⚠️ <b>Prompt constants rule</b>: the three <code>*_PROMPT</code> constants at the top of narrate.py '
-                'must be audited with <code>/prompt-audit</code> before committing any edit.',
-                border='#e53935',
-            )
-
-    with tab4:
-        st.markdown('#### Three prompt constants')
-        _file_badge('xai_forecast/narrate.py — WEEK_NARRATIVE_PROMPT / ITEM_NARRATIVE_PROMPT / EXECUTIVE_NARRATIVE_PROMPT')
-        st.code(_excerpt(narrate_src, 32, 95), language='python')
+        st.markdown('#### Planner — Flash decides which read-tools to call')
         _note(
-            'All three prompts share the same pattern:<br>'
-            '1. Role framing (retail analyst)<br>'
-            '2. Anti-hallucination rule (only use evidence JSON)<br>'
-            '3. Exact JSON schema inline<br>'
-            '4. Confidence thresholding rule<br>'
-            '5. Jargon ban (no "SHAP", "log-margin")<br>'
-            '6. Language constraint (English only)<br>'
-            '7. Self-review step (verify primary_driver, numbers, jargon before responding)',
+            'Before writing a hypothesis, Flash receives the finding type, score, summary, and '
+            'available evidence keys, then returns a JSON list of 1–4 read-tools to call. '
+            'This avoids calling every tool for every finding — dominant_driver gets '
+            '<code>read_recurring_drivers</code> + <code>read_model_metadata</code>; '
+            'external_coincidence always gets <code>read_external_signals</code>.',
             border='#6a1b9a',
         )
+        _file_badge('xai_forecast/insights/agents.py — run_planner()')
+        st.code(_excerpt(agents_src, 154, 176), language='python')
+
+        st.markdown('#### Seven read-tools (no LLM, no side effects)')
+        tools_list = [
+            ('read_forecast_accuracy', 'Global MAPE stats, bad/good week rates, worst week'),
+            ('read_bad_weeks', 'All flagged bad weeks with z-scores and avg MAPE'),
+            ('read_xai_findings', 'SHAP/CF/contrastive payloads — sample from worst week'),
+            ('read_demand_trajectory', 'Actual sales + lag_1 + rolling mean + forecast for one SKU over time'),
+            ('read_external_signals', 'LA weather, CA gas price, consumer sentiment for a specific week'),
+            ('read_model_metadata', 'Model config + global feature importance from last checkpoint'),
+            ('read_recurring_drivers', 'Feature appearance frequency across all bad-week SHAP payloads'),
+        ]
+        for tool, desc in tools_list:
+            _note(f'<code>{tool}</code>: {desc}', border='#6a1b9a')
+
+        st.markdown('#### _enrich_evidence — calls chosen tools and merges results')
+        _file_badge('xai_forecast/insights/graph.py — _enrich_evidence()')
+        st.code(_excerpt(graph_src, 40, 92), language='python')
+
+    with tab4:
+        st.markdown('#### Two-model split: Flash for volume, Pro for quality gate')
+        col1, col2 = st.columns(2)
+        with col1:
+            _note(
+                '<b>Flash (deepseek-v4-flash)</b>:<br>'
+                '• run_planner — choose read-tools<br>'
+                '• run_hypothesis — interpret evidence<br>'
+                '• run_synthesis — combine accepted findings<br>'
+                'Temperature 0.2. MAX_TOKENS_FLASH = 2000.',
+                border='#6a1b9a',
+            )
+        with col2:
+            _note(
+                '<b>Pro (deepseek-v4-pro)</b>:<br>'
+                '• run_critic — single quality gate<br>'
+                'Rejects overclaim, forbids causal external claims,<br>'
+                'downgrades weak evidence, sets final confidence.<br>'
+                'Temperature 0.1. MAX_TOKENS_PRO = 3000.',
+                border='#6a1b9a',
+            )
+
+        st.markdown('#### Grounding check — advisory, not a gate')
+        _note(
+            'After hypothesis, <code>_build_evidence_key_set(enriched)</code> builds a set containing '
+            'both full dot-paths (<code>model_metadata.global_feature_importance</code>) AND bare leaf names '
+            '(<code>global_feature_importance</code>). Flash\'s <code>evidence_refs</code> are matched '
+            'tolerantly: <code>_normalize_ref</code> converts <code>[0]</code> bracket notation to <code>.0</code> '
+            'before comparison.<br><br>'
+            '<b>Key design decision</b>: grounding result goes into <code>grounding_advisory: '
+            '{grounding_ok, missing_refs}</code> forwarded to the Pro critic as payload context — '
+            'it does NOT mutate <code>hypothesis.confidence</code> and does NOT bypass the critic. '
+            'The critic is the single quality gate.',
+            border='#e53935',
+        )
+        _file_badge('xai_forecast/insights/graph.py — review_finding (grounding + critic)')
+        st.code(_excerpt(graph_src, 139, 186), language='python')
+
+        st.markdown('#### run_critic — Pro quality gate')
+        _file_badge('xai_forecast/insights/agents.py — run_critic()')
+        st.code(_excerpt(agents_src, 210, 260), language='python')
+
+    with tab5:
+        st.markdown('#### Four prompt constants — run `/prompt-audit` before editing any')
+        _note(
+            '⚠️ All four are <code>*_PROMPT</code> constants in <code>agents.py</code>. '
+            'Per project rules, run <code>/prompt-audit</code> before committing any edit.',
+            border='#e53935',
+        )
+
+        st.markdown('#### PLANNER_PROMPT — Flash: choose read-tools')
+        _file_badge('xai_forecast/insights/agents.py — PLANNER_PROMPT')
+        st.code(_excerpt(agents_src, 28, 53), language='python')
+
+        st.markdown('#### HYPOTHESIS_PROMPT — Flash: write grounded hypothesis')
+        _file_badge('xai_forecast/insights/agents.py — HYPOTHESIS_PROMPT')
+        st.code(_excerpt(agents_src, 55, 78), language='python')
+
+        st.markdown('#### CRITIC_PROMPT — Pro: reject overclaim')
+        _file_badge('xai_forecast/insights/agents.py — CRITIC_PROMPT')
+        st.code(_excerpt(agents_src, 80, 103), language='python')
+
+        st.markdown('#### SYNTHESIS_PROMPT — Flash: two-perspective summary')
+        _file_badge('xai_forecast/insights/agents.py — SYNTHESIS_PROMPT')
+        st.code(_excerpt(agents_src, 105, 138), language='python')
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -594,9 +681,10 @@ elif section == '⚙️  Orchestration':
             )
             st.markdown('#### Clean slate at start')
             _note(
-                'Every run begins with <code>DELETE FROM forecasts/evaluations/xai_results/narratives</code>. '
-                'No partial runs, no orphan rows, always a clean consistent result. '
-                'INSERT OR REPLACE provides additional idempotency within a run.',
+                'Every run begins with <code>DELETE FROM forecasts; DELETE FROM evaluations;</code>. '
+                'xai_results and insight tables are managed by their own stages '
+                '(<code>run_xai.py</code>, <code>generate_insights.py</code>) — each clears its own tables. '
+                'No partial runs, no orphan rows. INSERT OR REPLACE provides additional idempotency within a run.',
                 border='#37474f',
             )
             st.markdown('#### Last two weeks excluded')
@@ -607,8 +695,13 @@ elif section == '⚙️  Orchestration':
                 border='#e53935',
             )
 
-        st.markdown('#### XAI + narrative phase (after bad-week flagging)')
-        st.code(_excerpt(backtest_src, 118, min(200, len(backtest_src.splitlines()))), language='python')
+        st.markdown('#### Evaluations + flagging (after main loop)')
+        _note(
+            '<code>flag_bad_weeks</code> runs on the full concatenated eval dataframe — needs all weeks to compute '
+            'the rolling WMAPE z-score baseline. Then <code>insert_evaluations</code> writes everything in one batch.',
+            border='#37474f',
+        )
+        st.code(_excerpt(backtest_src, 108, 142), language='python')
 
     with tab2:
         _file_badge('smoke_test.py')
@@ -622,7 +715,7 @@ elif section == '⚙️  Orchestration':
             '2. <b>Parallel forecast</b>: runs 10 weeks concurrently (ThreadPoolExecutor), validates h1≥0, SHAP additivity, JSON roundtrip.<br>'
             '3. <b>Contrastive</b>: validates same-WOY selection and shap_diff math.<br>'
             '4. <b>SHAP additivity</b>: base_value_log + Σ(top5) + other_features_shap ≈ log(prediction) ± 0.01.<br>'
-            '5. <b>Narrative API probe</b>: one live DeepSeek call. Fails loudly on bad config or truncation.',
+            '5. <b>DeepSeek API probe</b>: one live Flash call. Fails loudly on bad config or missing key.',
             border='#37474f',
         )
 
@@ -632,7 +725,7 @@ elif section == '⚙️  Orchestration':
 # ═══════════════════════════════════════════════════════════════════════════════
 
 elif section == '🗄️  Storage':
-    _header('🗄️ Storage', 'db.py · 4 migrations · SQLite WAL', COLORS[section])
+    _header('🗄️ Storage', 'db.py · 7 migrations · SQLite WAL', COLORS[section])
 
     db_src = _read('xai_forecast/db.py')
 
@@ -658,17 +751,19 @@ elif section == '🗄️  Storage':
                 'Important during the backtest — Streamlit dashboard can be open while backtest writes.',
                 border='#00695c',
             )
-            st.markdown('#### narratives table')
+            st.markdown('#### insight tables')
             _note(
-                'PRIMARY KEY (scope, key).<br>'
-                'Three scopes: <code>week</code> (key=forecast_week), '
-                '<code>item</code> (key=week::item_id), '
-                '<code>executive</code> (key="overall").',
+                '<code>insight_findings</code>: one row per candidate finding — '
+                'finding_id, finding_type, status (accepted/rejected/needs_review), confidence, '
+                'evidence JSON, hypothesis JSON, critic_notes. PRIMARY KEY (finding_id).<br><br>'
+                '<code>insight_summary</code>: single row keyed on "overall" — '
+                'data_scientist JSON, business_leader JSON, model_flash, model_critic, created_at. '
+                'Written by <code>generate_insights.py</code> (mandatory LLM — fails loudly without key).',
                 border='#00695c',
             )
 
     with tab2:
-        st.markdown('#### 4 migration files (applied in sorted order)')
+        st.markdown('#### 7 migration files (applied in sorted order)')
         for mig_file in sorted((ROOT / 'migrations').glob('*.sql')):
             with st.expander(mig_file.name):
                 st.code(mig_file.read_text(encoding='utf-8'), language='sql')
@@ -676,8 +771,16 @@ elif section == '🗄️  Storage':
         st.markdown('#### Table ownership')
         st.dataframe(
             {
-                'Table': ['weekly_sales', 'calendar', 'prices', 'item_meta', 'features', 'forecasts', 'evaluations', 'xai_results', 'narratives'],
-                'Written by': ['ingest.py', 'ingest.py', 'ingest.py', 'ingest.py', 'build_features.py', 'backtest.py', 'backtest.py', 'backtest.py', 'backtest.py'],
+                'Table': [
+                    'weekly_sales', 'calendar', 'prices', 'item_meta',
+                    'features', 'forecasts', 'evaluations', 'xai_results',
+                    'external_signals', 'insight_findings', 'insight_summary',
+                ],
+                'Written by': [
+                    'ingest.py', 'ingest.py', 'ingest.py', 'ingest.py',
+                    'build_features.py', 'backtest.py', 'backtest.py', 'run_xai.py',
+                    'ingest_external.py', 'generate_insights.py', 'generate_insights.py',
+                ],
                 'Purpose': [
                     'Raw weekly unit sales per SKU',
                     'SNAP, event flags per week',
@@ -687,26 +790,29 @@ elif section == '🗄️  Storage':
                     'h=1 predictions per SKU per week',
                     'MAPE, MAE, WMAPE z-score, bad-week flag',
                     'JSON payloads: shap / counterfactual / contrastive',
-                    'LLM narratives (scope, key) with model + created_at',
+                    'Per-week: LA weather, CA gas price, consumer sentiment',
+                    'Per-finding: status, confidence, evidence JSON, hypothesis JSON, critic notes',
+                    'Single overall row: DS view + business view + model names',
                 ],
             },
-            width="stretch",
+            use_container_width=True,
         )
 
     with tab3:
         st.markdown('#### Why INSERT OR REPLACE everywhere?')
         _note(
-            'All four output tables (forecasts, evaluations, xai_results, narratives) use '
-            '<code>INSERT OR REPLACE</code> keyed on their primary keys.<br><br>'
-            'This makes the backtest idempotent: re-running always produces a clean result. '
-            'The clean-slate DELETE at the start is the primary guarantee; INSERT OR REPLACE is '
-            'a belt-and-suspenders safety net for partial writes.',
+            'All output tables use <code>INSERT OR REPLACE</code> keyed on their primary keys. '
+            'Each stage clears its own tables at the start (clean-slate DELETE), '
+            'then INSERT OR REPLACE provides a belt-and-suspenders safety net for partial writes.<br><br>'
+            'This makes every stage independently idempotent: re-running '
+            '<code>generate_insights.py</code> alone always produces a clean result without '
+            'touching forecasts, evaluations, or xai_results.',
             border='#00695c',
         )
-        st.markdown('#### Example: insert_forecasts')
-        st.code(_excerpt(db_src, 92, 98), language='python')
-        st.markdown('#### Example: insert_narrative')
-        st.code(_excerpt(db_src, 143, 150), language='python')
+        st.markdown('#### Example: insert_forecasts (backtest)')
+        st.code(_excerpt(db_src, 113, 119), language='python')
+        st.markdown('#### Example: insert_insight_finding (insights module)')
+        st.code(_excerpt(db_src, 164, 172), language='python')
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -714,39 +820,70 @@ elif section == '🗄️  Storage':
 # ═══════════════════════════════════════════════════════════════════════════════
 
 elif section == '📊  Dashboard':
-    _header('📊 Dashboard', 'app.py — 4-page Streamlit leader view', COLORS[section])
+    _header('📊 Dashboard', 'app.py — single-page insights dashboard', COLORS[section])
 
     app_src = _read('app.py')
 
-    st.markdown('**Run:** `uv run streamlit run app.py` → `localhost:7501`')
+    st.markdown('**Run:** `uv run streamlit run app.py` → `localhost:8501`')
 
-    st.markdown('#### Pages')
-    pages = {
-        'Overview': ('lines 150–183', 'Weekly MAPE time series + bad-week markers (×). Four KPI tiles: total weeks, bad weeks, avg MAPE, worst MAPE.'),
-        'Bad Week Drilldown': ('lines 188–255', 'LLM week narrative card → worst-30 table → SHAP driver bar chart (mean |SHAP| per feature, % of SKUs labelled) → MAPE distribution histogram.'),
-        'Recurring Drivers': ('lines 260–314', 'LLM executive synthesis card → feature frequency bar chart (across all bad weeks) → frequency table with % of payloads.'),
-        'XAI Explorer': ('lines 319–504', 'LLM item narrative card → 3 tabs: SHAP waterfall (with residual bar), Counterfactual bar chart (active scenarios only, inactive grayed), Contrastive grouped bar + diff table.'),
-    }
-    for page_name, (loc, desc) in pages.items():
-        with st.expander(f'**{page_name}** — {loc}'):
+    st.markdown('#### Single-page layout (top → bottom)')
+    sections_info = [
+        ('1. MAPE time series', 'lines 96–132',
+         'Weekly avg MAPE line chart + bad-week markers (×). Four KPI tiles: total weeks, bad weeks, overall avg MAPE, worst week MAPE.'),
+        ('2. Insights summary', 'lines 135–195',
+         'Two-column layout: Data Scientist view (headline, summary, top issues, recommended actions) + Business Leader view (headline, summary, risk direction, limitations, improvement plan). Reads from insight_summary table.'),
+        ('3. Findings ledger', 'lines 198–265',
+         'Dataframe showing all findings (status, confidence, critic notes preview). Selectbox to inspect any finding — shows DS/business explanations + raw evidence JSON expander.'),
+        ('4. XAI drill-down', 'lines 268–434',
+         'Pick a bad week + item → SHAP waterfall (Plotly), Counterfactual bar chart (active scenarios only), Contrastive grouped bar + diff table.'),
+    ]
+    for title, loc, desc in sections_info:
+        with st.expander(f'**{title}** — {loc}'):
             st.markdown(desc)
 
-    tab1, tab2, tab3, tab4 = st.tabs(['Data helpers', 'SHAP waterfall', 'Counterfactual', 'Contrastive'])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        'Data loaders', 'MAPE + Insights', 'Findings ledger', 'SHAP waterfall', 'CF + Contrastive',
+    ])
 
     with tab1:
         st.markdown('#### Caching strategy')
-        st.code(_excerpt(app_src, 38, 103), language='python')
+        st.code(_excerpt(app_src, 42, 69), language='python')
         _note(
-            '<code>@st.cache_data</code> on stable reads (week_summary, evaluations, all_shap_payloads). '
-            'Narrative helpers are NOT cached — narratives can be regenerated between dashboard opens. '
-            'Bare <code>except (sqlite3.OperationalError, json.JSONDecodeError)</code> on narrative helpers '
-            '— only catches DB errors and malformed JSON, not generic exceptions.',
+            '<code>@st.cache_data</code> on all stable DB reads: '
+            '<code>_week_summary</code>, <code>_evaluations</code>, '
+            '<code>_insight_summary</code>, <code>_insight_findings</code>.<br><br>'
+            '<code>_xai(week, item)</code> is NOT cached — called on demand per item selection, '
+            'low volume (one week × one item at a time). '
+            'Cache is cleared automatically when Streamlit reruns.',
             border='#0277bd',
         )
 
     with tab2:
-        st.markdown('#### SHAP waterfall — the key visualisation')
-        st.code(_excerpt(app_src, 362, 397), language='python')
+        st.markdown('#### MAPE chart + KPI tiles')
+        st.code(_excerpt(app_src, 100, 132), language='python')
+        st.markdown('#### Two-perspective insights summary')
+        st.code(_excerpt(app_src, 135, 195), language='python')
+        _note(
+            'If <code>insight_summary</code> is empty (insights not yet generated), '
+            'shows an info banner with the command to run. '
+            'Risk direction is color-coded: over-stock=red, under-stock=orange, mixed=gray.',
+            border='#0277bd',
+        )
+
+    with tab3:
+        st.markdown('#### Findings ledger — auditable finding-by-finding view')
+        st.code(_excerpt(app_src, 198, 265), language='python')
+        _note(
+            'Each row in the ledger corresponds to one candidate finding that went through the '
+            'full detector → planner → hypothesis → critic chain. '
+            'Status badge (accepted/rejected/needs_review) + confidence badge come from the Pro critic. '
+            'Raw evidence JSON is shown in an expander for full traceability.',
+            border='#0277bd',
+        )
+
+    with tab4:
+        st.markdown('#### SHAP waterfall — top 5 features + residual')
+        st.code(_excerpt(app_src, 303, 345), language='python')
         _note(
             'Plotly Waterfall with <code>base=base_log</code>. The "other N features" bar is the residual '
             '(sum of non-top-5 SHAP values) — ensures the waterfall ends exactly at log(prediction). '
@@ -754,22 +891,21 @@ elif section == '📊  Dashboard':
             border='#0277bd',
         )
 
-    with tab3:
-        st.markdown('#### Counterfactual — inactive scenarios grayed')
-        st.code(_excerpt(app_src, 399, 455), language='python')
+    with tab5:
+        st.markdown('#### Counterfactual — active scenarios bar chart')
+        st.code(_excerpt(app_src, 347, 391), language='python')
         _note(
-            'Only active scenarios are plotted. Inactive scenarios (was_active=False) appear in '
-            'the table with ✗ label — visible but clearly not meaningful counterfactuals.',
+            'Only active scenarios are plotted as bars. Inactive scenarios (was_active=False) '
+            'appear in the full dataframe below with "No (inactive)" label — visible but not meaningful.',
             border='#0277bd',
         )
-
-    with tab4:
-        st.markdown('#### Contrastive — grouped bar: bad vs good week')
-        st.code(_excerpt(app_src, 457, 504), language='python')
+        st.markdown('#### Contrastive — grouped bar: bad vs good reference week')
+        st.code(_excerpt(app_src, 393, 434), language='python')
         _note(
             'Two bar series (red = bad week, blue = good reference) grouped by feature. '
-            'The diff table below shows <code>shap_diff = bad_shap − good_shap</code> — '
-            'the structural divergence between the two weeks.',
+            'The diff table shows <code>shap_diff = bad_shap − good_shap</code>. '
+            'If no same-WOY good week exists for this SKU, the tab shows a coverage note '
+            '(73% of items have no qualifying reference week).',
             border='#0277bd',
         )
 

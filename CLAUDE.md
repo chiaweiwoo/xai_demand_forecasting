@@ -194,16 +194,18 @@ Findings from full-run analysis (120 backtest weeks, 16 bad weeks, 800 SHAP payl
 
 **Stage 1 status: DONE (committed, gate passed).** `external_signals` is populated for all 278 fiscal weeks (2011-01-29 → 2016-05-21), zero gaps. Data is committed real CSVs under `external_data/` (Open-Meteo LA weather, EIA CA gas, U. Michigan consumer sentiment). `validate_external.py` runs 21 checks — all pass, including real-world anchors (Oct-2012 gas spike $4.71, Q1-2016 gas low $2.35, Aug-2011 sentiment 55.7, 2015 sentiment peak 98.1, 2013–15 drought precip below 2011). Gas maps to all 278 weeks with a direct EIA reading (no ffill needed). **Sentiment caveat:** FRED was unreachable from the build machine, so `tools/fetch_external_raw.py` fell back to embedded real historical UMCSENT values (verifiable on FRED); it tries the live endpoint first. **Stage 2 is NOT started** — `features.py`, `FEATURE_COLS`, models, and narratives are all unchanged; the signals are ingested but not yet used by the model.
 
-**Insights module status: LIVE.** `narrate.py` / `generate_narratives.py` / `narratives` table have been removed. The insights module (`xai_forecast/insights/`) is the active LLM layer. See [INSIGHTS_PLAN.md](INSIGHTS_PLAN.md) for the original design rationale. Pipeline step is now `generate_insights.py`; output tables are `insight_findings` + `insight_summary` (migration `007_insights.sql`). `langgraph` dependency added. Dashboard not yet updated to consume the new tables — that is the next planned step.
+**Insights module status: LIVE.** `narrate.py` / `generate_narratives.py` / `narratives` table have been removed. The insights module (`xai_forecast/insights/`) is the active LLM layer. See [INSIGHTS_PLAN.md](INSIGHTS_PLAN.md) for the original design rationale. Pipeline step is now `generate_insights.py`; output tables are `insight_findings` + `insight_summary` (migration `007_insights.sql`). `langgraph` dependency added. Dashboard (`app.py`) updated to single-page layout: MAPE chart → two-perspective insights summary → findings ledger → XAI drill-down.
 
-## Dashboard pages
+## Dashboard
 
-| Page | What it shows |
+Single-page layout (top → bottom):
+
+| Section | What it shows |
 |---|---|
-| Overview | Weekly MAPE time series with bad-week markers |
-| Bad Week Drilldown | LLM week narrative (headline card) + worst items + MAPE distribution + week-level SHAP aggregation |
-| Recurring Drivers | LLM executive synthesis + feature appearance frequency across all bad weeks |
-| XAI Explorer | LLM item narrative + per-item SHAP waterfall, counterfactual (inactive grayed), contrastive |
+| Model Performance | Weekly MAPE time series with bad-week markers + 4 KPI tiles |
+| Insights Summary | Two-column: Data Scientist view (issues, actions) + Business Leader view (risk direction, limitations, improvement plan) |
+| Findings Ledger | Dataframe of all findings with status/confidence badges; selectbox to inspect evidence + hypothesis |
+| XAI Drill-Down | Pick bad week + item → SHAP waterfall, Counterfactual bar chart, Contrastive grouped bar |
 
 ## Stack
 
