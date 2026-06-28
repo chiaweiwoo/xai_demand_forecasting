@@ -139,7 +139,9 @@ class _State(TypedDict):
 def _build_graph(conn: sqlite3.Connection, client: DeepSeekClient):
     """Build and compile the StateGraph, capturing conn/client in closures."""
 
-    def detect_candidates(state: dict) -> dict:
+    async def detect_candidates(state: dict) -> dict:
+        # async def keeps this in the event loop thread (same thread as conn).
+        # A sync def would be dispatched to a ThreadPoolExecutor, violating SQLite thread safety.
         log.info('Running detectors...')
         candidates = run_all_detectors(conn)
         log.info('%d candidate findings', len(candidates))
