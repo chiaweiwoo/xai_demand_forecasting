@@ -71,9 +71,12 @@ xai_forecast/
                      read_xai_findings, read_demand_trajectory, read_external_signals,
                      read_model_metadata, read_recurring_drivers
     llm_client.py    DeepSeekClient: call_flash (deepseek-v4-flash), call_pro (deepseek-v4-pro)
-    agents.py        run_planner, run_hypothesis, run_critic, run_synthesis + all *_PROMPT constants
-                     run /prompt-audit before editing any *_PROMPT constant
-    graph.py         LangGraph StateGraph: detect_candidates → fan-out review_finding → synthesize
+    agents.py        5 *_PROMPT constants + sync/async agent functions (run_planner[_async],
+                     run_hypothesis[_async], run_critic[_async], run_business_synthesis,
+                     run_technical_synthesis). run /prompt-audit before editing any *_PROMPT constant.
+    graph.py         Async LangGraph StateGraph: detect_candidates (async def, event-loop thread) →
+                     fan-out review_finding (async, concurrent per finding) → synthesize (async,
+                     business + technical passes via asyncio.gather). Invoked via graph.ainvoke.
                      Grounding check is advisory only — result forwarded to Pro critic, not a gate.
 
 tests/
@@ -157,7 +160,9 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 
 **XAI model — per retrain checkpoint:** SHAP/counterfactual/contrastive for each bad week are computed using the exact retrain checkpoint that produced that week's forecast (at 4-week granularity). `backtest.py` saves each checkpoint to `models/checkpoint_{cutoff}.lgbm` and the week→cutoff mapping to `db/week_to_cutoff.json`. `run_xai.py` loads these from disk so XAI can be re-run independently. Explainers are cached by checkpoint to avoid rebuilding per bad week. Contrastive compares both the bad week and its reference week under the **same model** (the bad week's checkpoint) to keep SHAP profiles in the same space.
 
-**XAI (top 50 worst SKUs per bad week):**
+**XAI (all valid SKUs per bad week):**
+- `run_xai.py` computes XAI for every evaluated SKU in each bad week (not a top-N sample). "Valid" = SKU present in evaluations for that week AND has at least one non-null feature. Full run produces ~101k rows across 18 bad weeks.
+- Parallel execution: `ProcessPoolExecutor` with one worker per bad-week. Worker function must be top-level (not a closure) for Windows spawn mode. Each worker opens its own `sqlite3.connect()` for read-only access; main process does chunked inserts (10k rows/chunk).
 - `shap`: TreeSHAP — top 5 drivers in log-margin space, plus `other_features_shap` (sum of remaining 14) so the waterfall reconciles: `base_value_log + Σ(top5) + other_features_shap ≈ log(prediction)`
 - `counterfactual`: zero out SNAP / event / price-change → measure prediction delta. Each scenario includes `was_active: bool` so the dashboard can distinguish meaningful zeroing from a no-op.
 - `contrastive`: compare SHAP profile vs a good reference week for the same SKU (same ISO week-of-year, MAPE < 15% in full eval history). Skips items with no same-WOY good week — no fallback to different-seasonality weeks. `contrastive_payloads` must receive `all_evals_df` (full history), not just the current bad week's evals — otherwise good reference weeks are never found. `seasonality_matched: True` in every payload (guaranteed by the skip logic).
@@ -168,25 +173,27 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 
 **Insights module (`xai_forecast/insights/` + `generate_insights.py`):**
 - Replaces the former `narrate.py` / `generate_narratives.py` / `narratives` table.
-- Architecture: deterministic detectors fire on real data thresholds → LangGraph `StateGraph` fan-out → per-finding: `run_planner` (Flash, chooses 1-4 read-tools) → `_enrich_evidence` (calls chosen tools) → `run_hypothesis` (Flash) → grounding advisory → `run_critic` (Pro) → fan-in → `run_synthesis` (Flash).
-- Two models: `deepseek-v4-flash` for planner/hypothesis/synthesis, `deepseek-v4-pro` for critic. Both via `DeepSeekClient` (OpenAI SDK, base_url `https://api.deepseek.com`). Key via `DEEPSEEK_API_KEY` env var.
+- Architecture: deterministic detectors fire on real data thresholds → LangGraph `StateGraph` async fan-out → per-finding (concurrent): `run_planner_async` (Flash, chooses 1-4 read-tools) → `_enrich_evidence` (sync SQLite reads) → `run_hypothesis_async` (Flash) → grounding advisory → `run_critic_async` (Pro) → fan-in → `synthesize` (two concurrent Flash passes via `asyncio.gather`).
+- Two synthesis passes run concurrently: `run_business_synthesis` (VP-facing progress + phased plan, zero jargon) and `run_technical_synthesis` (DS-facing bucketed levers: feature_engineering / model_param / workflow / algorithm).
+- Two models: `deepseek-v4-flash` for planner/hypothesis/synthesis, `deepseek-v4-pro` for critic. Both via `DeepSeekClient` (OpenAI SDK, base_url `https://api.deepseek.com`). Key via `DEEPSEEK_API_KEY` env var. `DeepSeekClient` exposes both sync (`call_flash`, `call_pro`) and async (`acall_flash`, `acall_pro`) methods.
 - **LLM is mandatory** — `generate_insights.py` fails loudly if `DEEPSEEK_API_KEY` is absent.
-- Four `*_PROMPT` constants in `agents.py`: `PLANNER_PROMPT`, `HYPOTHESIS_PROMPT`, `CRITIC_PROMPT`, `SYNTHESIS_PROMPT`. Run `/prompt-audit` before editing any of them.
+- **Five `*_PROMPT` constants in `agents.py`:** `PLANNER_PROMPT`, `HYPOTHESIS_PROMPT`, `CRITIC_PROMPT`, `BUSINESS_SYNTHESIS_PROMPT`, `TECHNICAL_SYNTHESIS_PROMPT`. Run `/prompt-audit` before editing any of them.
+- **`HYPOTHESIS_PROMPT` has a `CRITICAL` section** banning three failure modes: (1) model-feature causation (SHAP shows model weights, not demand drivers), (2) counterfactual extrapolation (sensitivity tests are not production causal claims), (3) coverage editorializing (state the number, don't infer reliability consequences). `CRITIC_PROMPT` codifies the same three triggers as explicit reject rules.
+- **Async graph:** all LangGraph nodes are `async def`. `detect_candidates` must stay `async def` — a sync node would be dispatched to a ThreadPoolExecutor, violating SQLite thread affinity (conn created in event loop thread). `graph.ainvoke` runs the fan-out nodes concurrently as asyncio tasks.
 - **Grounding check is advisory only.** After hypothesis, unmatched evidence refs are forwarded to the Pro critic as `grounding_advisory: {grounding_ok, missing_refs}`. The critic is the single quality gate — the grounding check does not gate or mutate confidence. Tolerant matching: bare leaf names and `[N]`-normalised paths both resolve correctly.
 - **Logging:** `generate_insights.py` sets up structured logging (INFO → console, DEBUG → `logs/insights.log`). Every agent step logs at DEBUG. `logs/` is gitignored.
-- LangGraph fan-out via `Send()` is serial in sync invocation — SQLite thread safety is not a concern.
 - `compute_recurring_drivers(shap_rows)` in `xai_forecast/db.py`: single source of truth for recurring-driver aggregation. Returns `{feature, count, pct_payloads, n_weeks, pct_bad_weeks}` per feature.
 
 **Pre-launch SKUs:** A SKU in its pre-launch weeks has all-NaN lag features. `make_forecasts` imputes these to 0 (via `.fillna(0)` before `model.predict`). If such a SKU has `y > 0` in that week, it is evaluated against a garbage forecast. `backtest.py` counts and logs these rows. `data_quality.py` checks for pre-launch price leakage (sell_price non-null with lag_1 null, excluding the first dataset week — week 1 legitimately has lag_1=NULL for all items since shift(1) returns NaN for the first row; a non-null price there is genuine raw data, not bfill).
 
 ## XAI insight quality — known limitations
 
-Findings from full-run analysis (120 backtest weeks, 16 bad weeks, 800 SHAP payloads):
+Findings from full-run analysis (120 backtest weeks, 18 bad weeks, ~101k SHAP payloads across all valid SKUs):
 
-- **100% of bad-week SHAP payloads are over-forecasts.** Bad weeks are always a systematic over-forecast, never under. This is not reflected in the current narratives.
-- **Two features dominate everything.** `rolling_4_mean` appears in 91% of payloads, `lag_1` in 87%. The model almost always over-anchors on recent sales history. LLM narratives are generic because the dossier looks the same across most items.
-- **Contrastive coverage is 27%** (171 of 645 explained items). Only items with a same-WOY week where MAPE < 15% get contrastive data. 73% of items have no contrastive panel in the dashboard.
-- **LLM item narratives add little value** — they paraphrase SHAP feature names without explaining the actual demand event (e.g. "demand collapsed from 65 to 1 unit — demand cliff" vs "recent trend shifted").
+- **Direction split is ~50/50 (over vs under-forecast) across the full SKU population.** The earlier "100% over-forecast" observation was an artifact of selecting the worst-50 SKUs by MAPE — extreme MAPE errors are biased toward over-forecasts. With the full population the `over_forecast_bias` detector no longer fires (threshold: ≥70% over).
+- **Two features dominate everything.** `rolling_4_mean` appears in ~91% of payloads, `lag_1` in ~87%. The model almost always over-anchors on recent sales history. LLM narratives tend to be generic because the dossier looks structurally similar across most bad weeks.
+- **Contrastive coverage is ~27%.** Only items with a same-WOY week where MAPE < 15% (in full eval history) get contrastive data. ~73% of items have no contrastive panel.
+- **Insights acceptance rate from the full-population run: 1/5** — `demand_cliff` accepted (high confidence), four others rejected. Three rejections (`dominant_driver`, `counterfactual_material`, `contrastive_gap`) were correct findings killed by Flash overclaiming causal direction. `HYPOTHESIS_PROMPT` and `CRITIC_PROMPT` were subsequently tightened to address this; re-running is expected to recover those three findings.
 
 **Project reframe (current direction):** the goal is not better forecast accuracy — it is **XAI-driven model governance**. Use the backtest + XAI to produce (a) a data-scientist "what to fix" list and (b) a business-facing "limitations + improvement plan". Model performance is explicitly not the focus; feature engineering stays lean.
 
@@ -194,7 +201,7 @@ Findings from full-run analysis (120 backtest weeks, 16 bad weeks, 800 SHAP payl
 
 **Stage 1 status: DONE (committed, gate passed).** `external_signals` is populated for all 278 fiscal weeks (2011-01-29 → 2016-05-21), zero gaps. Data is committed real CSVs under `external_data/` (Open-Meteo LA weather, EIA CA gas, U. Michigan consumer sentiment). `validate_external.py` runs 21 checks — all pass, including real-world anchors (Oct-2012 gas spike $4.71, Q1-2016 gas low $2.35, Aug-2011 sentiment 55.7, 2015 sentiment peak 98.1, 2013–15 drought precip below 2011). Gas maps to all 278 weeks with a direct EIA reading (no ffill needed). **Sentiment caveat:** FRED was unreachable from the build machine, so `tools/fetch_external_raw.py` fell back to embedded real historical UMCSENT values (verifiable on FRED); it tries the live endpoint first. **Stage 2 is NOT started** — `features.py`, `FEATURE_COLS`, models, and narratives are all unchanged; the signals are ingested but not yet used by the model.
 
-**Insights module status: LIVE.** `narrate.py` / `generate_narratives.py` / `narratives` table have been removed. The insights module (`xai_forecast/insights/`) is the active LLM layer. See [INSIGHTS_PLAN.md](INSIGHTS_PLAN.md) for the original design rationale. Pipeline step is now `generate_insights.py`; output tables are `insight_findings` + `insight_summary` (migration `007_insights.sql`). `langgraph` dependency added. Dashboard (`app.py`) updated to single-page layout: MAPE chart → two-perspective insights summary → findings ledger → XAI drill-down.
+**Insights module status: LIVE.** `narrate.py` / `generate_narratives.py` / `narratives` table have been removed. The insights module (`xai_forecast/insights/`) is the active LLM layer. See [INSIGHTS_PLAN.md](INSIGHTS_PLAN.md) for the original design rationale. Pipeline step is now `generate_insights.py`; output tables are `insight_findings` + `insight_summary` (migration `007_insights.sql`). `langgraph` + `openai` (AsyncOpenAI) dependencies added. Graph is fully async. Dashboard (`app.py`) is a single management storytelling page with actual-vs-forecast chart, two-perspective "What to do" section (business + DS), and a toggle-gated technical evidence appendix.
 
 ## Dashboard
 
@@ -204,9 +211,9 @@ Findings from full-run analysis (120 backtest weeks, 16 bad weeks, 800 SHAP payl
 |---|---|
 | Hero (verdict) | Bold one-line verdict (= synthesis business headline) + risk badge (over/under/mixed) + overall confidence + 3 live "so what" tiles (bad-week count, % over-forecast, plain-English root cause) |
 | What am I looking at? | Dataset (M5 Walmart CA_1, ~3k products, 2011–2016), the core question, the 4-step approach ribbon |
-| How we flag a bad week | Plain-language definition (spike vs chronic error) + MAPE time series with bad-week markers |
+| How we flag a bad week | Plain-language definition (spike vs chronic error) + **actual vs forecast time series** with red vertical bands (`add_vrect`) marking bad weeks. Not a MAPE chart — shows the gap between what was predicted and what sold. |
 | What we found | Accepted findings as story cards (plain title + business explanation + confidence), strongest first; rejected findings shown as an honest "we tested, evidence didn't hold" footnote |
-| What to do | Two columns: business recommendations (summary, improvement plan, limitations) + DS recommendations (summary, actions) |
+| What to do | Two columns: **Business** (renders `progress.health_verdict`, `progress.what_we_diagnosed`, `plan.phases[]`, `limitations[]`) + **DS** (renders `levers[]` grouped by bucket: feature_engineering / model_param / workflow / algorithm, with effort badge). `_BUCKET_LABEL` and `_EFFORT_LABEL` dicts in `app.py`. Falls back to old field names for runs predating the two-pass synthesis. |
 | Technical evidence | `st.toggle` (off by default): findings ledger + per-item SHAP / counterfactual / contrastive drill-down. A toggle, not an expander, to avoid nested-expander errors |
 
 **`overall_confidence` persistence:** the synthesis returns `overall_confidence` as a top-level key, but `insert_insight_summary` only stores the `data_scientist` + `business_leader` dicts. `generate_insights.py` folds `overall_confidence` into both dicts before insert so the hero can read it back.
