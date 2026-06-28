@@ -19,7 +19,8 @@ uv run python run_xai.py              # SHAP / counterfactual / contrastive → 
 uv run python generate_insights.py    # evidence-first insights → insight_findings, insight_summary (re-runnable independently)
 uv run python data_quality.py         # post-run integrity checks (run before opening dashboard)
 uv run streamlit run app.py           # dashboard at localhost:8501
-uv run streamlit run code_review.py --server.port 7501  # code walkthrough app
+uv run streamlit run code_review.py --server.port 7501  # annotated source code walkthrough
+uv run streamlit run walkthrough.py --server.port 8502  # newcomer XAI + LLM concept walkthrough
 uv run pytest                         # 85 tests covering features, evaluation, XAI contracts, DB, end-to-end, insights
 ```
 

@@ -112,7 +112,7 @@ if section == '🗺️  Overview':
         '> **"The model performed badly at week X — why?"**\n\n'
         'Standard dashboards show a MAPE spike and stop there. '
         'This project goes further: for every bad week it produces three types of XAI explanation '
-        'for the top-50 worst SKUs, then synthesises them into a plain-English narrative a business '
+        'for all valid non-pre-launch SKUs, then synthesises them into plain-English insights a business '
         'leader can read without knowing what SHAP is.'
     )
 
@@ -125,7 +125,7 @@ if section == '🗺️  Overview':
 <b style="color:#1565c0">DATA LAYER</b><br>
 &nbsp;&nbsp;M5 CSVs (Kaggle) <br>
 &nbsp;&nbsp;&nbsp;&nbsp;→ <b>ingest.py</b> → SQLite: <i>weekly_sales, calendar, prices, item_meta</i><br>
-&nbsp;&nbsp;&nbsp;&nbsp;→ <b>build_features.py</b> → SQLite: <i>features</i> (847k rows, 19 cols, ~46s one-time)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;→ <b>build_features.py</b> → SQLite: <i>features</i> (847k rows, 26 cols, ~46s one-time)<br>
 
 <br><b style="color:#2e7d32">ML LAYER</b><br>
 &nbsp;&nbsp;<b>backtest.py</b> ← feature store (SQL SELECT per week, ~2s)<br>
@@ -134,7 +134,7 @@ if section == '🗺️  Overview':
 &nbsp;&nbsp;&nbsp;&nbsp;→ <b>evaluate.py</b>: WMAPE z-score ≥ 1.5 → bad-week flag<br>
 
 <br><b style="color:#e65100">XAI LAYER</b><br>
-&nbsp;&nbsp;For each bad week (top 50 worst SKUs):<br>
+&nbsp;&nbsp;For each bad week (all valid non-pre-launch SKUs):<br>
 &nbsp;&nbsp;&nbsp;&nbsp;→ <b>xai.py / SHAP</b>: TreeSHAP — top-5 drivers in log-margin space<br>
 &nbsp;&nbsp;&nbsp;&nbsp;→ <b>xai.py / Counterfactual</b>: zero out SNAP/event/price → measure prediction delta<br>
 &nbsp;&nbsp;&nbsp;&nbsp;→ <b>xai.py / Contrastive</b>: diff SHAP vs a good same-WOY reference week<br>
@@ -163,7 +163,7 @@ if section == '🗺️  Overview':
     c2.metric('Total weeks', '278', '2011–2016')
     c3.metric('Backtest weeks', '~120', 'sliding window')
     c4.metric('Retrains', '~30', 'every 4 weeks')
-    c5.metric('Features', '19', '5 lag + 4 rolling + …')
+    c5.metric('Features', '26', '19 ML + 7 external signals')
 
     st.markdown('---')
     st.markdown('### Why these design choices?')
@@ -211,11 +211,11 @@ elif section == '📦  Data Layer':
 
     with tab1:
         _file_badge('xai_forecast/features.py')
-        st.markdown('**Single source of truth** for all 19 features. Used by `build_features.py`, `backtest.py`, `smoke_test.py`, and all tests.')
+        st.markdown('**Single source of truth** for all 26 features. Used by `build_features.py`, `backtest.py`, `smoke_test.py`, and all tests.')
 
         col1, col2 = st.columns([1, 1])
         with col1:
-            st.markdown('#### Feature columns (19 total)')
+            st.markdown('#### Feature columns (26 total)')
             st.code(_excerpt(features_src, 14, 21), language='python')
             _note(
                 '<b>5 lags</b>: lag_1/2/4/8/52 — lag_52 is the same-week-last-year anchor (year-over-year seasonality).<br>'
@@ -350,7 +350,7 @@ elif section == '🔍  XAI Engine':
     xai_src = _read('xai_forecast/xai.py')
 
     st.markdown(
-        'For each bad week, the **top 50 worst SKUs** receive three types of explanation. '
+        'For each bad week, **all valid non-pre-launch SKUs** receive three types of explanation. '
         'All are computed using the **exact retrain checkpoint** that produced that week\'s forecast.'
     )
 
@@ -367,7 +367,7 @@ elif section == '🔍  XAI Engine':
             _note(
                 'Tweedie uses a log-link. SHAP values are additive in log-margin space:<br><br>'
                 '<code>base_value_log + Σ(top5 shap) + other_features_shap ≈ log(prediction)</code><br><br>'
-                'The <code>other_features_shap</code> term is the sum of the 14 non-top-5 features — '
+                'The <code>other_features_shap</code> term is the sum of the 21 non-top-5 features — '
                 'included so the waterfall chart in the dashboard reconciles exactly to the actual prediction.',
                 border='#e65100',
             )
@@ -499,7 +499,7 @@ elif section == '💬  Insights Module':
 <b>fan-in: ledger_rows (Annotated[list, add] reducer)</b><br>
 <br>
 <b>synthesize</b>:<br>
-&nbsp;&nbsp;→ filter accepted findings → run_synthesis(Flash) → DS view + business view<br>
+&nbsp;&nbsp;→ filter accepted findings → run_business_synthesis + run_technical_synthesis (concurrent asyncio.gather) → DS view + business view<br>
 &nbsp;&nbsp;→ stored in insight_summary table<br>
 </div>
 ''',
@@ -590,7 +590,7 @@ elif section == '💬  Insights Module':
                 '• run_planner — choose read-tools<br>'
                 '• run_hypothesis — interpret evidence<br>'
                 '• run_synthesis — combine accepted findings<br>'
-                'Temperature 0.2. MAX_TOKENS_FLASH = 2000.',
+                'Temperature 0.2 (planner/hypothesis) or 0.0 (synthesis). MAX_TOKENS_FLASH = 3000.',
                 border='#6a1b9a',
             )
         with col2:
@@ -599,7 +599,7 @@ elif section == '💬  Insights Module':
                 '• run_critic — single quality gate<br>'
                 'Rejects overclaim, forbids causal external claims,<br>'
                 'downgrades weak evidence, sets final confidence.<br>'
-                'Temperature 0.1. MAX_TOKENS_PRO = 3000.',
+                'Temperature 0.0 (deterministic governance artifact). MAX_TOKENS_PRO = 4096.',
                 border='#6a1b9a',
             )
 
@@ -624,28 +624,50 @@ elif section == '💬  Insights Module':
         st.code(_excerpt(agents_src, 210, 260), language='python')
 
     with tab5:
-        st.markdown('#### Four prompt constants — run `/prompt-audit` before editing any')
+        st.markdown('#### Five prompt constants — run `/prompt-audit` before editing any')
         _note(
-            '⚠️ All four are <code>*_PROMPT</code> constants in <code>agents.py</code>. '
+            '⚠️ All five are <code>*_PROMPT</code> constants in <code>agents.py</code>. '
             'Per project rules, run <code>/prompt-audit</code> before committing any edit.',
             border='#e53935',
         )
 
         st.markdown('#### PLANNER_PROMPT — Flash: choose read-tools')
-        _file_badge('xai_forecast/insights/agents.py — PLANNER_PROMPT')
-        st.code(_excerpt(agents_src, 28, 53), language='python')
+        _file_badge('xai_forecast/insights/agents.py — PLANNER_PROMPT (line 31)')
+        st.code(_excerpt(agents_src, 31, 58), language='python')
 
         st.markdown('#### HYPOTHESIS_PROMPT — Flash: write grounded hypothesis')
-        _file_badge('xai_forecast/insights/agents.py — HYPOTHESIS_PROMPT')
-        st.code(_excerpt(agents_src, 55, 78), language='python')
+        _file_badge('xai_forecast/insights/agents.py — HYPOTHESIS_PROMPT (line 60)')
+        _note(
+            '<b>CRITICAL section</b>: three banned failure modes — '
+            '(1) model-feature causation (SHAP shows model weights, not demand drivers), '
+            '(2) counterfactual extrapolation (sensitivity tests are not production causal claims), '
+            '(3) coverage editorializing (state the %, never infer reliability consequences). '
+            'The CRITIC_PROMPT enforces the same three rules as explicit reject triggers.',
+            border='#e53935',
+        )
+        st.code(_excerpt(agents_src, 60, 125), language='python')
 
-        st.markdown('#### CRITIC_PROMPT — Pro: reject overclaim')
-        _file_badge('xai_forecast/insights/agents.py — CRITIC_PROMPT')
-        st.code(_excerpt(agents_src, 80, 103), language='python')
+        st.markdown('#### CRITIC_PROMPT — Pro: reject overclaim (temperature=0)')
+        _file_badge('xai_forecast/insights/agents.py — CRITIC_PROMPT (line 126)')
+        st.code(_excerpt(agents_src, 126, 164), language='python')
 
-        st.markdown('#### SYNTHESIS_PROMPT — Flash: two-perspective summary')
-        _file_badge('xai_forecast/insights/agents.py — SYNTHESIS_PROMPT')
-        st.code(_excerpt(agents_src, 105, 138), language='python')
+        st.markdown('#### BUSINESS_SYNTHESIS_PROMPT — Flash: VP-facing brief (temperature=0)')
+        _file_badge('xai_forecast/insights/agents.py — BUSINESS_SYNTHESIS_PROMPT (line 166)')
+        _note(
+            'Zero jargon. Renders: headline, progress (health_verdict, diagnosis), '
+            'plan (phases, impact), limitations, risk_direction, overall_confidence.',
+            border='#6a1b9a',
+        )
+        st.code(_excerpt(agents_src, 166, 201), language='python')
+
+        st.markdown('#### TECHNICAL_SYNTHESIS_PROMPT — Flash: DS-facing levers (temperature=0)')
+        _file_badge('xai_forecast/insights/agents.py — TECHNICAL_SYNTHESIS_PROMPT (line 203)')
+        _note(
+            'Buckets: feature_engineering | model_param | workflow | algorithm. '
+            'Each lever must cite a specific statistic from the accepted findings.',
+            border='#6a1b9a',
+        )
+        st.code(_excerpt(agents_src, 203, 250), language='python')
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -905,7 +927,7 @@ elif section == '📊  Dashboard':
             'Two bar series (red = bad week, blue = good reference) grouped by feature. '
             'The diff table shows <code>shap_diff = bad_shap − good_shap</code>. '
             'If no same-WOY good week exists for this SKU, the tab shows a coverage note '
-            '(73% of items have no qualifying reference week).',
+            '(59% of items have no qualifying reference week).',
             border='#0277bd',
         )
 
