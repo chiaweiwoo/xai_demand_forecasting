@@ -1,6 +1,6 @@
 # External Signals — Implementation Plan
 
-**Status:** **Stage 1 DONE (committed, gate passed). Stage 2 not started.**
+**Status:** **COMPLETE — both stages done.**
 **Owner handoff:** Written on Opus (planning). Execution must run on **Sonnet** (project rule: Opus plans, Sonnet executes).
 **Last updated:** 2026-06-27
 
@@ -158,9 +158,9 @@ All boxes green (commit `64f3053`). **Stage 1 gate passed — awaiting human rev
 
 ---
 
-## 5. STAGE 2 — Everything else (outline; detail after Stage 1 review)
+## 5. STAGE 2 — COMPLETE
 
-Do not start until Stage 1 is reviewed and signed off. Keep feature wiring **lean** (decision 5).
+All steps delivered. Keep feature wiring **lean** (decision 5) — no further feature additions planned.
 
 1. **`features.py`** — LEFT JOIN `external_signals` on `week`; add the 7 curated columns to `FEATURE_COLS`
    (~19 → ~26). Document the contemporaneous lookahead (decision 2) in the leakage-controls section.

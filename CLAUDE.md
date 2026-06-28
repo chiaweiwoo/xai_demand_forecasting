@@ -20,7 +20,7 @@ uv run python generate_insights.py    # evidence-first insights → insight_find
 uv run python data_quality.py         # post-run integrity checks (run before opening dashboard)
 uv run streamlit run app.py           # dashboard at localhost:8501
 uv run streamlit run code_review.py --server.port 7501  # code walkthrough app
-uv run pytest                         # 84 tests covering features, evaluation, XAI contracts, DB, end-to-end, insights
+uv run pytest                         # 85 tests covering features, evaluation, XAI contracts, DB, end-to-end, insights
 ```
 
 **Each stage is independently re-runnable.** If only insights need fixing, re-run `generate_insights.py` alone — no need to redo ML or XAI. If XAI logic changes, re-run `run_xai.py` + `generate_insights.py`. Only re-run `backtest.py` if model training or evaluation logic changes.
@@ -45,9 +45,9 @@ smoke_test.py           Sanity check: feature staleness, parallel forecast, cont
 data_quality.py         Post-run: referential integrity, h1>=0, pre-launch price leakage, etc.
 app.py                  Streamlit dashboard (4 pages — see Dashboard section)
 
-ingest_external.py      Stage 1: reads committed external_data/*.csv → external_signals table.
+ingest_external.py      Reads committed external_data/*.csv → external_signals table.
                         Sat–Fri weather roll-up, fiscal-week gas mapping, monthly sentiment ffill. Idempotent.
-                        NOTE: external_signals is NOT yet consumed by features.py (Stage 2 will wire it in).
+                        external_signals IS consumed by features.py (Stage 2 complete).
 validate_external.py    Stage 1 gate: 21 PASS/FAIL checks (coverage + structural + real-world anchors).
 tools/
   fetch_external_raw.py Run-once internet fetch (Open-Meteo LA weather, EIA CA gas, FRED sentiment) →
@@ -119,7 +119,7 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 | `xai_results` | run_xai.py | JSON payloads: shap / counterfactual / contrastive |
 | `insight_findings` | generate_insights.py | One row per candidate finding: status, confidence, evidence JSON, hypothesis JSON, critic notes |
 | `insight_summary` | generate_insights.py | Single 'overall' row: DS-facing + business-facing synthesis JSON, model names |
-| `external_signals` | ingest_external.py | Per-fiscal-week LA weather + CA gas + consumer sentiment (Stage 1). NOT yet read by features.py |
+| `external_signals` | ingest_external.py | Per-fiscal-week LA weather + CA gas + consumer sentiment. Read by features.py (Stage 2 complete). |
 
 ## Key design decisions
 
@@ -133,13 +133,17 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 
 **Feature store:** `build_features.py` precomputes all 847k feature rows once (~46s). `backtest.py` and `smoke_test.py` do a plain SQL SELECT per iteration instead of recomputing features. Per-iteration time went from ~36s to ~2s. **Must be rebuilt whenever `features.py` changes** — `build_features.py` always clears and rebuilds, so just re-run it. The smoke test catches staleness before a full run.
 
-**Features (19 total):**
+**Features (26 total):**
 - Lags (5): lag_1, lag_2, lag_4, lag_8, lag_52 — lag_52 is the same-week-last-year seasonality anchor
 - Rolling (4): rolling_4/8/13_mean, rolling_4_std — all use `shift(1)` before `.rolling()` to exclude current week
 - Calendar (3): week_of_year, month, year
 - Store context (3): snap, has_event, event_type_enc
 - Price (2): sell_price (ffill within item only — no bfill), price_change_pct
 - Item metadata (2): dept_mean_sales, cat_mean_sales
+- External signals (7): temp_mean, temp_max, temp_min, precip, heat_days, gas_price, consumer_sentiment
+  — contemporaneous (week-t signal at week-t forecast). Mild deliberate lookahead accepted for retrospective
+  explainability (EXTERNAL_SIGNALS_PLAN.md, decision 2). LEFT JOIN from external_signals on week in compute_features().
+  `ext_df=None` in tests fills these columns with 0.0.
 
 **Leakage controls:**
 - Lag features: `shift(n)` per SKU — lag_1 at week t = sales[t-1]
@@ -147,6 +151,7 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 - `sell_price` NaN: `ffill` within item only — no `.bfill()`. Pre-launch NaNs stay NaN and are dropped by `dropna(FEATURE_COLS)` at training time. Using `bfill` here would pull a future price backward into 87k pre-launch rows across 60% of SKUs, allowing them to survive `dropna` and enter training with leaked data.
 - `price_change_pct`: computed after ffill, `fill_method=None`
 - dept_mean_sales / cat_mean_sales: static prior computed over full history — a mild, deliberate lookahead accepted for stability (only 7 dept / 3 cat scalars; demand scale is stationary). Do not claim zero leakage for these.
+- External signals: contemporaneous (week-t signal used at week-t forecast). Deliberate mild lookahead accepted for retrospective explainability (EXTERNAL_SIGNALS_PLAN.md decision 2). LA weather proxy (largest CA population center); CA state-level gas and sentiment.
 
 **Objective:** Tweedie (variance_power=1.5) — correct for zero-heavy intermittent count data (64% zero-sale days). SHAP values are in **log-margin space** (Tweedie log-link). `base_value_log + Σ(shap_values) = log(prediction)`. Feature ranking by `|shap|` is valid.
 
@@ -163,7 +168,7 @@ Schema is applied automatically by `get_conn()` via `_setup_schema()` — no man
 **XAI (all valid SKUs per bad week):**
 - `run_xai.py` computes XAI for every evaluated SKU in each bad week (not a top-N sample). "Valid" = SKU present in evaluations for that week AND has at least one non-null feature. Full run produces ~101k rows across 18 bad weeks.
 - Parallel execution: `ProcessPoolExecutor` with one worker per bad-week. Worker function must be top-level (not a closure) for Windows spawn mode. Each worker opens its own `sqlite3.connect()` for read-only access; main process does chunked inserts (10k rows/chunk).
-- `shap`: TreeSHAP — top 5 drivers in log-margin space, plus `other_features_shap` (sum of remaining 14) so the waterfall reconciles: `base_value_log + Σ(top5) + other_features_shap ≈ log(prediction)`
+- `shap`: TreeSHAP — top 5 drivers in log-margin space, plus `other_features_shap` (sum of remaining 21) so the waterfall reconciles: `base_value_log + Σ(top5) + other_features_shap ≈ log(prediction)`
 - `counterfactual`: zero out SNAP / event / price-change → measure prediction delta. Each scenario includes `was_active: bool` so the dashboard can distinguish meaningful zeroing from a no-op.
 - `contrastive`: compare SHAP profile vs a good reference week for the same SKU (same ISO week-of-year, MAPE < 15% in full eval history). Skips items with no same-WOY good week — no fallback to different-seasonality weeks. `contrastive_payloads` must receive `all_evals_df` (full history), not just the current bad week's evals — otherwise good reference weeks are never found. `seasonality_matched: True` in every payload (guaranteed by the skip logic).
 
@@ -193,13 +198,11 @@ Findings from full-run analysis (120 backtest weeks, 18 bad weeks, ~101k SHAP pa
 - **Direction split is ~50/50 (over vs under-forecast) across the full SKU population.** The earlier "100% over-forecast" observation was an artifact of selecting the worst-50 SKUs by MAPE — extreme MAPE errors are biased toward over-forecasts. With the full population the `over_forecast_bias` detector no longer fires (threshold: ≥70% over).
 - **Two features dominate everything.** `rolling_4_mean` appears in ~91% of payloads, `lag_1` in ~87%. The model almost always over-anchors on recent sales history. LLM narratives tend to be generic because the dossier looks structurally similar across most bad weeks.
 - **Contrastive coverage is ~27%.** Only items with a same-WOY week where MAPE < 15% (in full eval history) get contrastive data. ~73% of items have no contrastive panel.
-- **Insights acceptance rate from the full-population run: 1/5** — `demand_cliff` accepted (high confidence), four others rejected. Three rejections (`dominant_driver`, `counterfactual_material`, `contrastive_gap`) were correct findings killed by Flash overclaiming causal direction. `HYPOTHESIS_PROMPT` and `CRITIC_PROMPT` were subsequently tightened to address this; re-running is expected to recover those three findings.
+- **Insights acceptance rate: 5/5** after prompt fixes. Earlier 1/5 run was caused by a contradiction in `HYPOTHESIS_PROMPT` (a "state risk direction" directive surviving alongside a "purely descriptive" global rule). Removing the contradiction + setting critic/synthesis to temperature=0 stabilised results. Current run: demand_cliff, dominant_driver, counterfactual_material, contrastive_gap, external_coincidence — all accepted, all high confidence except external_coincidence (medium).
 
 **Project reframe (current direction):** the goal is not better forecast accuracy — it is **XAI-driven model governance**. Use the backtest + XAI to produce (a) a data-scientist "what to fix" list and (b) a business-facing "limitations + improvement plan". Model performance is explicitly not the focus; feature engineering stays lean.
 
-**Active plan — external signals:** see [EXTERNAL_SIGNALS_PLAN.md](EXTERNAL_SIGNALS_PLAN.md). Adds a curated fast set of real, committed external signals (LA weather, CA gas price, consumer sentiment) so the XAI has real-world causes to point at instead of only autoregressive lags. Two-stage: Stage 1 = external ingestion only (hard stop + validation gate), Stage 2 = lean feature wiring → backtest → xai → narratives → a new "Model Limitations & Improvement Plan" dashboard view. The full plan, locked decisions, sources, and validation anchors live in that file.
-
-**Stage 1 status: DONE (committed, gate passed).** `external_signals` is populated for all 278 fiscal weeks (2011-01-29 → 2016-05-21), zero gaps. Data is committed real CSVs under `external_data/` (Open-Meteo LA weather, EIA CA gas, U. Michigan consumer sentiment). `validate_external.py` runs 21 checks — all pass, including real-world anchors (Oct-2012 gas spike $4.71, Q1-2016 gas low $2.35, Aug-2011 sentiment 55.7, 2015 sentiment peak 98.1, 2013–15 drought precip below 2011). Gas maps to all 278 weeks with a direct EIA reading (no ffill needed). **Sentiment caveat:** FRED was unreachable from the build machine, so `tools/fetch_external_raw.py` fell back to embedded real historical UMCSENT values (verifiable on FRED); it tries the live endpoint first. **Stage 2 is NOT started** — `features.py`, `FEATURE_COLS`, models, and narratives are all unchanged; the signals are ingested but not yet used by the model.
+**External signals: COMPLETE (both stages).** See [EXTERNAL_SIGNALS_PLAN.md](EXTERNAL_SIGNALS_PLAN.md) for full plan and locked decisions. Stage 1 (ingestion + validation) and Stage 2 (feature wiring + full pipeline retrain) are both done. `external_signals` table has 278 rows, all 7 columns null-free; signals are wired into `FEATURE_COLS` (26 total); models retrained; XAI recomputed; insights regenerated (5/5 accepted including `external_coincidence`). External signals don't appear in top-5 SHAP for most items — the autoregressive lags (rolling_4_mean, lag_1) still dominate — but they are in the model and in `other_features_shap`.
 
 **Insights module status: LIVE.** `narrate.py` / `generate_narratives.py` / `narratives` table have been removed. The insights module (`xai_forecast/insights/`) is the active LLM layer. See [INSIGHTS_PLAN.md](INSIGHTS_PLAN.md) for the original design rationale. Pipeline step is now `generate_insights.py`; output tables are `insight_findings` + `insight_summary` (migration `007_insights.sql`). `langgraph` + `openai` (AsyncOpenAI) dependencies added. Graph is fully async. Dashboard (`app.py`) is a single management storytelling page with actual-vs-forecast chart, two-perspective "What to do" section (business + DS), and a toggle-gated technical evidence appendix.
 

@@ -174,6 +174,13 @@ _FEATURE_PLAIN = {
     'lag_1':           "last week's sales",
     'lag_2':           'sales two weeks ago',
     'lag_52':          'the same week last year',
+    'temp_mean':       'average weekly temperature',
+    'temp_max':        'peak weekly temperature',
+    'temp_min':        'lowest weekly temperature',
+    'precip':          'weekly rainfall',
+    'heat_days':       'number of hot days that week',
+    'gas_price':       'California gas price',
+    'consumer_sentiment': 'consumer confidence index',
 }
 
 _RISK = {
