@@ -88,6 +88,12 @@ CRITICAL — model behaviour vs. real-world causation (the most common rejection
   Say "coincided with" or "occurred during" — never "caused by" or "due to".
 
 Per-finding scope restrictions:
+- dominant_driver: business_explanation must state which feature appears most often (name it,
+  give the percentage) and note that the model leans heavily on recent sales history.
+  Use association language: "when recent sales shift sharply, errors tend to follow" or
+  "the model is sensitive to recent trend changes".
+  NEVER say recent sales "cause" forecast errors or "lead to" over-/under-forecasting.
+  There is no causal experiment in the evidence — state the correlation only.
 - contrastive_gap: this is an ANALYSIS LIMITATION, not a demand pattern. business_explanation
   must say which fraction of items lack a comparison week — nothing more.
   NEVER say it "reduces reliability", "limits conclusions", or "affects ordering decisions".
@@ -106,8 +112,9 @@ Per-finding scope restrictions:
   note the gap in ds_explanation — do not fabricate a direction.
 - Before writing final JSON, verify: (1) every number came from the evidence JSON,
   (2) no causal claim anywhere — model sensitivity only, (3) suggested_fix is actionable,
-  (4) for contrastive_gap: no reliability or ordering consequence stated,
-  (5) for counterfactual_material: no bad-week coincidence claimed.
+  (4) for dominant_driver: no "cause" or "lead to" language in business_explanation,
+  (5) for contrastive_gap: no reliability or ordering consequence stated,
+  (6) for counterfactual_material: no bad-week coincidence claimed.
 - Respond in English only."""
 
 CRITIC_PROMPT = """\
