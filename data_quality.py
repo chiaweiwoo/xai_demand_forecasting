@@ -139,7 +139,7 @@ def main() -> None:
                     n_additivity_fail += 1
         except Exception:
             n_additivity_fail += 1
-    all_ok &= _check(f'SHAP additivity (sample {len(shap_rows)}): base+shap≈log(pred)',
+    all_ok &= _check(f'SHAP additivity (sample {len(shap_rows)}): base+shap~=log(pred)',
                      n_additivity_fail == 0, f'{n_additivity_fail} failed')
 
     # ── Features table ───────────────────────────────────────────────────────
