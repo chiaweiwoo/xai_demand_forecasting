@@ -17,7 +17,7 @@ except ImportError:
     _OPENAI_AVAILABLE = False
 
 MAX_TOKENS_FLASH  = 2000
-MAX_TOKENS_PRO    = 3000
+MAX_TOKENS_PRO    = 4096
 
 
 class DeepSeekClient:

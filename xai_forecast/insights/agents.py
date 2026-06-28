@@ -53,6 +53,8 @@ Rules:
 - For over_forecast_bias findings: read_forecast_accuracy and read_recurring_drivers suffice.
 - For counterfactual_material findings: read_xai_findings and read_bad_weeks suffice.
 - Only include tools from the list above. Return exactly the tool names as shown.
+- If finding_type is not listed above, default to read_forecast_accuracy and read_recurring_drivers.
+- Before returning, confirm every tool name is spelled exactly as shown in the list above.
 - Respond in English only."""
 
 HYPOTHESIS_PROMPT = """\
@@ -85,13 +87,27 @@ CRITICAL — model behaviour vs. real-world causation (the most common rejection
 - External signals (weather, gas price, sentiment): state CORRELATION only.
   Say "coincided with" or "occurred during" — never "caused by" or "due to".
 
+Per-finding scope restrictions:
+- contrastive_gap: this is an ANALYSIS LIMITATION, not a demand pattern. business_explanation
+  must say which fraction of items lack a comparison week — nothing more.
+  NEVER say it "reduces reliability", "limits conclusions", or "affects ordering decisions".
+  The field says "states risk direction" — for contrastive_gap the correct risk direction is
+  "analysis limitation: no seasonal benchmark for X% of items". That is the full claim.
+- counterfactual_material: the ONLY valid claim is model sensitivity.
+  "Zeroing feature X changes the model's prediction by N% for M% of items" is correct.
+  Do NOT cross-reference bad_weeks data to infer that SNAP or events coincide with high-error weeks.
+  Do NOT claim the model was wrong because of SNAP activity. The evidence pack shows sensitivity,
+  not which weeks were bad or why.
+
 - For over_forecast_bias or dominant_driver: state the risk direction explicitly
   (e.g. "over-ordering risk", "excess inventory bias").
 - For demand_cliff: quote the actual lag_1 and actual sales numbers from the top example.
 - If evidence is absent or contradictory with no clear pattern, set confidence=low AND
   note the gap in ds_explanation — do not fabricate a direction.
 - Before writing final JSON, verify: (1) every number came from the evidence JSON,
-  (2) no causal claim anywhere — model sensitivity only, (3) suggested_fix is actionable.
+  (2) no causal claim anywhere — model sensitivity only, (3) suggested_fix is actionable,
+  (4) for contrastive_gap: no reliability or ordering consequence stated,
+  (5) for counterfactual_material: no bad-week coincidence claimed.
 - Respond in English only."""
 
 CRITIC_PROMPT = """\
@@ -121,7 +137,10 @@ Rules:
 - Accept if: all claims traceable to the evidence pack, correlation-only for external,
   no feature→world causation, no counterfactual extrapolation, no coverage editorializing,
   and the finding is specific enough to act on.
-- causal_external = true if the hypothesis says external signals CAUSED the error.
+- causal_external = true if the hypothesis turns ANY model-sensitivity result (counterfactual,
+  SHAP, feature importance) into a production causal claim — whether about external signals
+  (weather, gas, sentiment) OR internal features (SNAP, events, price change).
+  Example: "SNAP schedule changes cause forecast errors" → causal_external=true, status="rejected".
   If causal_external is true, status MUST be "rejected".
 - overclaim = true if hypothesis asserts facts not present in the evidence.
 - If `grounding_advisory` is present in the input and grounding_ok is false, treat it as one
