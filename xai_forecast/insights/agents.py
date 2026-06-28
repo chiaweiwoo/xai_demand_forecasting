@@ -69,15 +69,29 @@ Rules:
    "suggested_fix": "<one concrete, actionable recommendation for the data scientist>",
    "confidence": "<high|medium|low>"}
 - confidence = high if n evidence rows >= 10 and pattern is unambiguous; medium if 3-9; low if < 3.
-- If evidence contains external signal conditions: state them as CORRELATION only.
-  Never say "caused by" or "due to" for external signals — say "coincided with" or "during a period of".
+
+CRITICAL — model behaviour vs. real-world causation (the most common rejection reason):
+- SHAP values and feature importance describe what the MODEL uses internally — not why demand moved.
+  Say "the model weights X heavily" or "the model is sensitive to Y" — NEVER "X causes demand to fall"
+  or "Y drives sales". Do not assert real-world causal direction from SHAP alone.
+- Counterfactual scenarios are model sensitivity tests only.
+  "Zeroing the SNAP feature reduces the model's prediction by N%" is correct.
+  NEVER extend this to "SNAP schedule changes cause forecast errors" or "therefore X drives real demand".
+  Counterfactuals show what the model responds to — not what the world does.
+- Coverage and quantity statistics must be stated plainly — never editorialize the consequence.
+  "41% of items have a seasonal reference week" is correct.
+  NEVER say "low coverage limits reliability" or "insufficient coverage impairs conclusions".
+  State the number; let the reviewer judge its implication.
+- External signals (weather, gas price, sentiment): state CORRELATION only.
+  Say "coincided with" or "occurred during" — never "caused by" or "due to".
+
 - For over_forecast_bias or dominant_driver: state the risk direction explicitly
   (e.g. "over-ordering risk", "excess inventory bias").
 - For demand_cliff: quote the actual lag_1 and actual sales numbers from the top example.
 - If evidence is absent or contradictory with no clear pattern, set confidence=low AND
   note the gap in ds_explanation — do not fabricate a direction.
 - Before writing final JSON, verify: (1) every number came from the evidence JSON,
-  (2) no causal claim for external signals, (3) suggested_fix is actionable.
+  (2) no causal claim anywhere — model sensitivity only, (3) suggested_fix is actionable.
 - Respond in English only."""
 
 CRITIC_PROMPT = """\
@@ -94,9 +108,18 @@ Rules:
    "causal_external": <true|false>}
 - Reject if: hypothesis invents facts not in evidence, claims causation for external signals,
   or uses hedged language to sneak in speculation ("likely caused by", "probably due to weather").
+- Reject if: hypothesis claims a model feature CAUSES real-world demand to move (not just that the
+  model weights it). "The model relies on rolling_4_mean" is acceptable; "rolling_4_mean causes
+  higher sales predictions" is a causal overclaim → set overclaim=true, status="rejected".
+- Reject if: hypothesis extends a counterfactual ("zeroing X changes the prediction by N%") into a
+  production causal claim ("therefore X schedule changes cause forecast errors"). Counterfactuals
+  are model sensitivity tests only → set overclaim=true, status="rejected".
+- Reject if: hypothesis editorializes a coverage percentage into a reliability consequence
+  ("low coverage limits SHAP reliability"). Coverage stats must be descriptive only → overclaim=true.
 - Downgrade confidence if: evidence rows < 3, pattern not consistent across weeks,
   or the finding could have an equally plausible alternative explanation.
 - Accept if: all claims traceable to the evidence pack, correlation-only for external,
+  no feature→world causation, no counterfactual extrapolation, no coverage editorializing,
   and the finding is specific enough to act on.
 - causal_external = true if the hypothesis says external signals CAUSED the error.
   If causal_external is true, status MUST be "rejected".
